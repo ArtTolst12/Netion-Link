@@ -74,10 +74,17 @@ Requirements:
 - All operations run strictly on-device and within your local private network.
 - Network traffic passes only between your connected devices and your chosen upstream VPN/ISP.
 
-### License
+### Third-Party Libraries & Licenses
 
-Distributed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
-See [LICENSE](LICENSE) for details.
+Netion Link is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+This project incorporates the following open-source libraries:
+
+- **Android Jetpack & Compose** (Google LLC) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- **AndroidX CameraX** (Google LLC) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- **Kotlin Standard Library & Coroutines** (JetBrains s.r.o.) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- **ZXing ("Zebra Crossing") Core** (ZXing authors) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+
+See [LICENSE](LICENSE) for the full AGPL-3.0 license text.
 
 ---
 
