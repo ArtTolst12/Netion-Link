@@ -1,4 +1,4 @@
-**Русский** | [Русский](README_RU.md)
+[Русский язык](README_RU.md)
 
 ## English
 
