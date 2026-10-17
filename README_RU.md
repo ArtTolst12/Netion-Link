@@ -88,10 +88,17 @@ Netion Link решает эту проблему:
 
 ---
 
-## Лицензия
+### Сторонние библиотеки и лицензии
 
-Проект распространяется под свободной лицензией **GNU Affero General Public License v3.0 (AGPL-3.0)**.
-Подробности см. в файле [LICENSE](LICENSE).
+Проект Netion Link распространяется под лицензией **GNU Affero General Public License v3.0 (AGPL-3.0)**. 
+В проекте используются библиотеки с открытым исходным кодом:
+
+- **Android Jetpack & Compose** (Google LLC) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- **AndroidX CameraX** (Google LLC) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- **Kotlin Standard Library & Coroutines** (JetBrains s.r.o.) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- **ZXing ("Zebra Crossing") Core** (ZXing authors) — [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+
+Подробный текст основной лицензии проекта доступен в файле [LICENSE](LICENSE).
 
 ---
 
