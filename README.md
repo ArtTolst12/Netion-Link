@@ -1,6 +1,4 @@
-[Русский язык](README_RU.md)
-
-## English
+##Netion Link
 
 Share VPN and proxy connections between devices without Root permissions.
 
