@@ -108,6 +108,8 @@ The project also uses the following libraries for testing:
 - [AndroidX Espresso](https://developer.android.com/training/testing/espresso) — 3.7.0, Apache License 2.0.
 - AndroidX Compose UI Testing — version managed by the Compose BOM.
 
+Testing dependencies are used solely at build time for running automated unit tests (`testImplementation`), are not included in the compiled APK binary, and are not distributed to end users. Therefore, their licenses (including EPL-1.0 for JUnit 4) do not affect the licensing of the distributed application binary and do not conflict with the project's AGPLv3 distribution terms.
+
 Third-party components remain subject to their respective licenses and copyright notices. This section lists the project's directly declared dependencies; transitive dependencies may have additional license notices.
 
 ### License
