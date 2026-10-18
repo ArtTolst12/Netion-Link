@@ -31,7 +31,7 @@ Netion Link solves this issue:
 ### Installation
 
 1. Navigate to the [Releases](https://github.com/ArtTolst12/Netion-Link/releases) section.
-2. Download the latest release APK (`Netion_Link_V2.3.15.apk`).
+2. Download the latest release APK (`Netion_Link_V2.3.16.apk`).
 3. Install the APK on your Android device (allow installation from unknown sources if prompted).
 
 ### Usage Guide

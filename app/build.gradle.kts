@@ -4,17 +4,17 @@ plugins {
 }
 
 android {
-    namespace = "com.example.netion"
+    namespace = "io.github.arttolst12.netion"
     compileSdk {
         version = release(37)
     }
 
     defaultConfig {
-        applicationId = "com.example.netion"
+        applicationId = "io.github.arttolst12.netion"
         minSdk = 24
         targetSdk = 37
-        versionCode = 15
-        versionName = "2.3.15"
+        versionCode = 16
+        versionName = "2.3.16"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
