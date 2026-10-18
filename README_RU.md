@@ -1,6 +1,9 @@
-[English](README.md) | **Русский**
 
 # Netion Link
+
+---
+
+[English](README.md) | **Русский**
 
 ---
 
