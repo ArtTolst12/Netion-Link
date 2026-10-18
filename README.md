@@ -110,8 +110,6 @@ The project also uses the following libraries for testing:
 
 Third-party components remain subject to their respective licenses and copyright notices. This section lists the project's directly declared dependencies; transitive dependencies may have additional license notices.
 
-Netion Link itself is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the [LICENSE](LICENSE) file for details.
-
 ### License
 
 Distributed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
