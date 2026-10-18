@@ -14,14 +14,6 @@ Netion Link solves this issue:
 1. **On the host device (Server):** runs a local HTTP and SOCKS5 proxy server that routes traffic through the phone's active VPN tunnel.
 2. **On the client device (Client):** utilizes a built-in TUN VPN service to intercept supported system traffic and redirect it to the host proxy without requiring complex manual proxy configuration.
 
-### Original purpose, disclaimer and limitations
-
-Netion Link was initially created for the developer's personal use on mobile networks in the Russian Federation that apply allowlists (often called “white lists”). Its intended use is to route traffic from a connected device through a primary VPN that the user has already configured and connected on the host device.
-
-**Netion Link does not provide VPN servers, proxy servers outside the user's devices, or a VPN subscription.** Users must provide and configure their own upstream VPN and are responsible for how they use the app and any third-party services. The project is provided “as is”, without a guarantee that it will work with every carrier, network, VPN provider, destination, or configuration. The author and contributors are not responsible for service interruptions, blocked connections, or the availability and policies of third-party networks and services.
-
-The app was developed first for a personal use case, not as a guaranteed high-availability service. **Stability during long-running sessions is not guaranteed.** Network operators may block or change access to VPNs, proxies, or particular protocols. Support for arbitrary UDP traffic and IPv6 is limited in the current implementation.
-
 ### Features
 
 - **Tethering over any interface:** Wi-Fi Hotspot, shared Wi-Fi local network, or USB tethering.
@@ -60,6 +52,15 @@ The app was developed first for a personal use case, not as a guaranteed high-av
 2. Open proxy settings on your PC:
    - On Windows: Settings -> Network & internet -> Proxy -> Manual proxy setup.
 3. Enter the phone's IP address (shown on the Server tab, e.g., `192.168.43.1`) and port `8080` (HTTP) or `1080` (SOCKS5).
+
+**### Original purpose, disclaimer and limitations
+
+Netion Link was initially created for the developer's personal use on mobile networks in the Russian Federation that apply allowlists (often called “white lists”). Its intended use is to route traffic from a connected device through a primary VPN that the user has already configured and connected on the host device.
+
+**Netion Link does not provide VPN servers, proxy servers outside the user's devices, or a VPN subscription.** Users must provide and configure their own upstream VPN and are responsible for how they use the app and any third-party services. The project is provided “as is”, without a guarantee that it will work with every carrier, network, VPN provider, destination, or configuration. The author and contributors are not responsible for service interruptions, blocked connections, or the availability and policies of third-party networks and services.
+
+The app was developed first for a personal use case, not as a guaranteed high-availability service. **Stability during long-running sessions is not guaranteed.** Network operators may block or change access to VPNs, proxies, or particular protocols. Support for arbitrary UDP traffic and IPv6 is limited in the current implementation.
+**
 
 ### Building from Source
 
