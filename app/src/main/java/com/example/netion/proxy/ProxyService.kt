@@ -76,6 +76,7 @@ class ProxyService : Service() {
             acquireLocks()
 
             val server = ProxyServer(requestedHttpPort = httpPort, requestedSocks5Port = socksPort)
+            server.clientFilter = { addr -> com.example.netion.NetworkUtils.isClientAllowed(addr) }
             server.onPortReallocated = { newHttp, newSocks ->
                 activeHttpPort = newHttp
                 activeSocksPort = newSocks
@@ -95,7 +96,7 @@ class ProxyService : Service() {
             activeSocksPort = server.socks5Port
             isRunning = true
             Log.i(TAG, "ProxyServer started on HTTP port ${server.httpPort} and SOCKS5 port ${server.socks5Port}")
-            com.example.netion.AppLogger.s("Server", "Служба прокси запущена. HTTP=$activeHttpPort, SOCKS5=$activeSocksPort")
+            com.example.netion.AppLogger.s("Server", "Proxy service started. HTTP=$activeHttpPort, SOCKS5=$activeSocksPort")
         }
 
         val notification = buildNotification(activeHttpPort, activeSocksPort)

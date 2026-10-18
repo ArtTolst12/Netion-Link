@@ -342,7 +342,7 @@ object NetworkUtils {
         }
     }
 
-    private fun areInSameSubnet(ip1: String, ip2: String, prefixLength: Int): Boolean {
+    fun areInSameSubnet(ip1: String, ip2: String, prefixLength: Int): Boolean {
         return try {
             val b1 = java.net.InetAddress.getByName(ip1).address
             val b2 = java.net.InetAddress.getByName(ip2).address
@@ -354,6 +354,41 @@ object NetworkUtils {
         } catch (_: Exception) {
             false
         }
+    }
+
+    /**
+     * Determines whether an incoming client connection is allowed.
+     * Restricts access strictly to expected tethering/hotspot interfaces, USB-tethering,
+     * local Wi-Fi, and loopback, preventing unauthorized external subnets from proxying traffic.
+     */
+    fun isClientAllowed(clientAddr: java.net.InetAddress): Boolean {
+        if (clientAddr.isLoopbackAddress) return true
+        val clientIpStr = clientAddr.hostAddress ?: return false
+
+        // Known standard hotspot / USB subnets
+        if (clientIpStr.startsWith("192.168.43.") || clientIpStr.startsWith("192.168.42.")) {
+            return true
+        }
+
+        try {
+            val allIfaces = java.net.NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()
+            for (iface in allIfaces) {
+                val name = iface.name.lowercase(java.util.Locale.ROOT)
+                if (isForbiddenIface(name, emptySet())) continue
+                for (ifaceAddr in iface.interfaceAddresses) {
+                    val ifAddr = ifaceAddr.address
+                    if (ifAddr is java.net.Inet4Address && !ifAddr.isLoopbackAddress) {
+                        val ifIpStr = ifAddr.hostAddress ?: continue
+                        val prefix = ifaceAddr.networkPrefixLength.toInt()
+                        if (prefix in 8..30 && areInSameSubnet(ifIpStr, clientIpStr, prefix)) {
+                            return true
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        return false
     }
 
     /**

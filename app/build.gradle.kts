@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.netion"
         minSdk = 24
         targetSdk = 37
-        versionCode = 3
-        versionName = "2.2.1"
+        versionCode = 15
+        versionName = "2.3.15"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

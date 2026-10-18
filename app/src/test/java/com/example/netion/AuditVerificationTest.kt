@@ -45,4 +45,33 @@ class AuditVerificationTest {
         assertEquals(0x12.toByte(), response[0])
         assertEquals(0x34.toByte(), response[1])
     }
+
+    @Test
+    fun testAboutAppStringsDefinedInAllLanguages() {
+        val allStrings = listOf(
+            com.example.netion.ui.RuStrings,
+            com.example.netion.ui.EnStrings,
+            com.example.netion.ui.DeStrings,
+            com.example.netion.ui.FrStrings,
+            com.example.netion.ui.EsStrings,
+            com.example.netion.ui.PtStrings,
+            com.example.netion.ui.PlStrings,
+            com.example.netion.ui.ZhStrings,
+            com.example.netion.ui.JaStrings,
+            com.example.netion.ui.KoStrings
+        )
+        for (s in allStrings) {
+            assertTrue(s.aboutAppTitle.isNotBlank())
+            assertTrue(s.aboutAppDesc.isNotBlank())
+            assertTrue(s.aboutAppSubtitle.isNotBlank())
+            assertTrue(s.aboutRepoTitle.isNotBlank())
+            assertTrue(s.aboutRepoDesc.isNotBlank())
+            assertTrue(s.aboutLicenseTitle.isNotBlank())
+            assertTrue(s.aboutLicenseDesc.isNotBlank())
+            assertTrue(s.aboutWarrantyTitle.isNotBlank())
+            assertTrue(s.aboutWarrantyDesc.isNotBlank())
+            assertTrue(s.aboutPrivacyTitle.isNotBlank())
+            assertTrue(s.aboutPrivacyDesc.isNotBlank())
+        }
+    }
 }

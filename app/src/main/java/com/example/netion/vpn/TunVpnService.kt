@@ -19,7 +19,14 @@ import android.util.Log
 import com.example.netion.MainActivity
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * VPN client: intercepts all device traffic via TUN interface,
@@ -36,6 +43,7 @@ class TunVpnService : VpnService() {
         const val EXTRA_PROXY_PORT = "proxy_port"
         const val EXTRA_PROXY_TYPE = "proxy_type"
         const val ACTION_STOP      = "com.example.netion.STOP_VPN"
+        const val MAX_ACTIVE_TCP_SESSIONS = 128
 
         @Volatile var isRunning = false
         /** Last error message (read by UI, then cleared) */
@@ -55,6 +63,11 @@ class TunVpnService : VpnService() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    private val globalUploadBytes = AtomicLong(0L)
+    private var selector: Selector? = null
+    private var selectorThread: Thread? = null
+    private var cleanupScheduler: ScheduledExecutorService? = null
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
@@ -62,7 +75,7 @@ class TunVpnService : VpnService() {
 
     override fun onRevoke() {
         Log.i(TAG, "VPN permission revoked by user or system")
-        com.example.netion.AppLogger.w("VPN", "Разрешение VPN отозвано пользователем или системой")
+        com.example.netion.AppLogger.w("VPN", "VPN permission revoked by user or system")
         stopVpn()
         stopSelf()
         super.onRevoke()
@@ -108,71 +121,108 @@ class TunVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    private val lifecycleLock = Any()
+    internal val tunGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+
     // ─────────────────────────────────────────────────
     // VPN setup
     // ─────────────────────────────────────────────────
 
     private fun startVpn(proxyIp: String, proxyPort: Int, proxyType: String) {
-        stopVpn()
-        acquireLocks()
+        synchronized(lifecycleLock) {
+            // Clean up previous connection instance WITHOUT dropping foreground notification
+            cleanupConnectionsLocked()
+            val myGen = tunGeneration.incrementAndGet()
+            acquireLocks()
 
-        val isSocks = (proxyType.uppercase() == "SOCKS5" || proxyPort == 1080)
+            val isSocks = (proxyType.uppercase() == "SOCKS5" || proxyPort == 1080)
 
-        val builder = Builder()
-            .addAddress("10.0.0.2", 24)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("8.8.8.8")
-            .addDnsServer("1.1.1.1")
-            .setSession("Netion Link VPN")
-            .setMtu(1400)
-            .setBlocking(true)
+            val builder = Builder()
+                .addAddress("10.0.0.2", 24)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("8.8.8.8")
+                .addDnsServer("1.1.1.1")
+                .setSession("Netion Link VPN")
+                .setMtu(1400)
+                .setBlocking(true)
 
-        // Exclude our own app from VPN to prevent loops
-        try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: Exception) {}
-
-        pfd = builder.establish()
-
-        if (pfd == null) {
-            Log.e(TAG, "VPN establish() returned null")
-            lastError = "VPN не установлен — проверьте разрешения"
-            stopVpn()
-            stopSelf()
-            return
-        }
-
-        val fd = pfd!!
-
-        val underlyingNetwork = com.example.netion.NetworkUtils.getUnderlyingNetwork(this, proxyIp)
-        if (underlyingNetwork != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+            // Exclude our own app from VPN to prevent loops
             try {
-                setUnderlyingNetworks(arrayOf(underlyingNetwork))
-                com.example.netion.AppLogger.d("VPN", "Установлена базовая сеть VPN: $underlyingNetwork")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to set underlying network: ${e.message}")
+                builder.addDisallowedApplication(packageName)
+            } catch (_: Exception) {}
+
+            pfd = builder.establish()
+
+            if (pfd == null) {
+                Log.e(TAG, "VPN establish() returned null")
+                lastError = "VPN не установлен — проверьте разрешения"
+                cleanupConnectionsLocked()
+                isRunning = false
+                removeForegroundNotification()
+                stopSelf()
+                return
             }
+
+            val fd = pfd!!
+
+            val underlyingNetwork = com.example.netion.NetworkUtils.getUnderlyingNetwork(this, proxyIp)
+            if (underlyingNetwork != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
+                try {
+                    setUnderlyingNetworks(arrayOf(underlyingNetwork))
+                    com.example.netion.AppLogger.d("VPN", "Underlying network set: $underlyingNetwork")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to set underlying network: ${e.message}")
+                }
+            }
+
+            val writer = TunWriter(FileOutputStream(fd.fileDescriptor)) { bytesWritten ->
+                clientBytesRx.addAndGet(bytesWritten.toLong())
+            }
+            tunWriter = writer
+            dnsResolver = DnsResolver(this, writer, proxyIp, proxyPort, isSocks)
+
+            isRunning = true
+            lastError = null
+            clientBytesRx.set(0L)
+            clientBytesTx.set(0L)
+
+            val sel = Selector.open()
+            selector = sel
+            val sThread = Thread({
+                runSelectorLoop(sel, myGen)
+            }, "vpn-selector-$myGen").also {
+                it.isDaemon = true
+                it.start()
+            }
+            selectorThread = sThread
+
+            val scheduler = Executors.newSingleThreadScheduledExecutor()
+            cleanupScheduler = scheduler
+            scheduler.scheduleAtFixedRate({
+                val now = System.currentTimeMillis()
+                sessions.entries.removeIf { entry ->
+                    val session = entry.value
+                    if (session.isDead) {
+                        true
+                    } else if (session.isExpired(now)) {
+                        Log.d(TAG, "Cleaning up expired/stale TCP session: ${entry.key}")
+                        session.close()
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }, 10L, 10L, TimeUnit.SECONDS)
+
+            tunThread = Thread({ runTunLoop(proxyIp, proxyPort, isSocks, fd, myGen) }, "tun-reader-$myGen").also {
+                it.isDaemon = true
+                it.start()
+            }
+
+            registerNetworkCallback(proxyIp)
+            Log.i(TAG, "VPN started → proxy $proxyIp:$proxyPort ($proxyType)")
+            com.example.netion.AppLogger.s("VPN", "Netion Link VPN started → Proxy: $proxyIp:$proxyPort ($proxyType)")
         }
-
-        val writer = TunWriter(FileOutputStream(fd.fileDescriptor)) { bytesWritten ->
-            clientBytesRx.addAndGet(bytesWritten.toLong())
-        }
-        tunWriter = writer
-        dnsResolver = DnsResolver(this, writer, proxyIp, proxyPort, isSocks)
-
-        isRunning = true
-        lastError = null
-        clientBytesRx.set(0L)
-        clientBytesTx.set(0L)
-
-        tunThread = Thread({ runTunLoop(proxyIp, proxyPort, isSocks, fd) }, "tun-reader").also {
-            it.isDaemon = true
-            it.start()
-        }
-
-        registerNetworkCallback(proxyIp)
-        Log.i(TAG, "VPN started → proxy $proxyIp:$proxyPort ($proxyType)")
-        com.example.netion.AppLogger.s("VPN", "Netion Link VPN запущен → Прокси: $proxyIp:$proxyPort ($proxyType)")
     }
 
     private fun removeForegroundNotification() {
@@ -184,19 +234,25 @@ class TunVpnService : VpnService() {
         }
     }
 
-    private fun stopVpn() {
-        if (isRunning) {
-            com.example.netion.AppLogger.i("VPN", "Netion Link VPN остановлен")
-        }
-        isRunning = false
-
-        removeForegroundNotification()
+    private fun cleanupConnectionsLocked() {
         unregisterNetworkCallback()
         releaseLocks()
 
-        // Close all sessions
+        cleanupScheduler?.shutdownNow()
+        cleanupScheduler = null
+
+        // 1. Close all sessions first so they return memory to globalUploadBytes
         sessions.values.forEach { it.close() }
         sessions.clear()
+
+        // 2. Close selector and stop thread
+        try { selector?.close() } catch (_: Exception) {}
+        selector = null
+        selectorThread?.interrupt()
+        selectorThread = null
+
+        // 3. Reset global memory tracker cleanly to 0
+        globalUploadBytes.set(0L)
 
         dnsResolver?.close()
         dnsResolver = null
@@ -213,20 +269,108 @@ class TunVpnService : VpnService() {
         pfd = null
     }
 
+    private fun stopVpn() {
+        synchronized(lifecycleLock) {
+            val wasRunning = isRunning
+            isRunning = false
+            tunGeneration.incrementAndGet()
+
+            removeForegroundNotification()
+            cleanupConnectionsLocked()
+
+            if (wasRunning) {
+                com.example.netion.AppLogger.i("VPN", "Netion Link VPN stopped")
+            }
+        }
+    }
+
+    internal fun onFatalSelectorError(myGen: Long, cause: Throwable) {
+        synchronized(lifecycleLock) {
+            if (tunGeneration.get() != myGen || !isRunning) return
+            Log.e(TAG, "Fatal selector error for generation $myGen, stopping VPN: ${cause.message}", cause)
+            com.example.netion.AppLogger.e("VPN", "NIO selector failed: ${cause.message}. Stopping VPN service.")
+            isRunning = false
+            tunGeneration.incrementAndGet()
+            try { removeForegroundNotification() } catch (_: Throwable) {}
+            cleanupConnectionsLocked()
+            try { stopSelf() } catch (_: Throwable) {}
+        }
+    }
+
+    // ─────────────────────────────────────────────────
+    // NIO Selector loop
+    // ─────────────────────────────────────────────────
+
+    internal fun runSelectorLoop(sel: Selector, myGen: Long) {
+        // MTU is 1400. IP (20) + TCP (20) headers = 40. Maximum safe read payload is TcpSession.MSS (1360).
+        val readBuf = ByteBuffer.allocate(TcpSession.MSS)
+        var fatalError: Throwable? = null
+        try {
+            while (isRunning && !Thread.currentThread().isInterrupted && tunGeneration.get() == myGen) {
+                val count: Int
+                try {
+                    count = sel.select(1000)
+                } catch (e: Exception) {
+                    if (isRunning && tunGeneration.get() == myGen && sel.isOpen) {
+                        Log.e(TAG, "Selector.select() failed: ${e.message}", e)
+                        fatalError = e
+                    }
+                    break
+                }
+                if (count == 0) continue
+                val iter = sel.selectedKeys().iterator()
+                while (iter.hasNext()) {
+                    val key = iter.next()
+                    iter.remove()
+                    if (!key.isValid) continue
+                    val session = key.attachment() as? TcpSession ?: continue
+                    try {
+                        if (key.isValid && key.isReadable) {
+                            session.onProxyReadable(readBuf)
+                        }
+                        if (key.isValid && key.isWritable) {
+                            session.onProxyWritable()
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error servicing key for session ${session.key()}: ${e.message}", e)
+                        try { session.sendRst() } catch (_: Exception) {}
+                        session.close()
+                        try { key.cancel() } catch (_: Exception) {}
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            if (isRunning && tunGeneration.get() == myGen) {
+                Log.e(TAG, "Fatal error in selector loop: ${e.message}", e)
+                fatalError = e
+            }
+        } finally {
+            if (fatalError != null && isRunning && tunGeneration.get() == myGen) {
+                onFatalSelectorError(myGen, fatalError)
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────
     // TUN packet loop
     // ─────────────────────────────────────────────────
 
-    private fun runTunLoop(proxyIp: String, proxyPort: Int, isSocks: Boolean, fd: ParcelFileDescriptor) {
+    private fun runTunLoop(
+        proxyIp: String,
+        proxyPort: Int,
+        isSocks: Boolean,
+        fd: ParcelFileDescriptor,
+        generation: Long
+    ) {
         val input = FileInputStream(fd.fileDescriptor)
         val buf = ByteArray(32767)
 
-        Log.i(TAG, "TUN read loop started")
+        Log.i(TAG, "TUN read loop started (generation $generation)")
 
         var lastCleanupTime = System.currentTimeMillis()
 
         try {
-            while (isRunning && !Thread.currentThread().isInterrupted) {
+            while (isRunning && !Thread.currentThread().isInterrupted && tunGeneration.get() == generation) {
                 val len = input.read(buf)
                 if (len <= 0) {
                     Thread.sleep(10)
@@ -239,7 +383,7 @@ class TunVpnService : VpnService() {
                 val ipHeader = PacketUtils.parseIpHeader(data, len) ?: continue
 
                 when (ipHeader.protocol) {
-                    PacketUtils.PROTO_TCP -> handleTcpPacket(data, ipHeader, proxyIp, proxyPort, isSocks)
+                    PacketUtils.PROTO_TCP -> handleTcpPacket(data, ipHeader, proxyIp, proxyPort, isSocks, generation)
                     PacketUtils.PROTO_UDP -> handleUdpPacket(data, ipHeader)
                 }
 
@@ -264,14 +408,21 @@ class TunVpnService : VpnService() {
         } catch (e: InterruptedException) {
             // Normal shutdown
         } catch (e: Exception) {
-            if (isRunning) {
+            if (isRunning && tunGeneration.get() == generation) {
                 Log.e(TAG, "TUN loop error: ${e.message}")
                 lastError = "VPN ошибка: ${e.message}"
             }
+        } finally {
+            Log.i(TAG, "TUN read loop stopped (generation $generation)")
+            try { input.close() } catch (_: Exception) {}
+            try { fd.close() } catch (_: Exception) {}
+            synchronized(lifecycleLock) {
+                if (isRunning && tunGeneration.get() == generation) {
+                    stopVpn()
+                    stopSelf()
+                }
+            }
         }
-
-        Log.i(TAG, "TUN read loop stopped")
-        isRunning = false
     }
 
     // ─────────────────────────────────────────────────
@@ -283,7 +434,8 @@ class TunVpnService : VpnService() {
         ipHeader: PacketUtils.IpHeader,
         proxyIp: String,
         proxyPort: Int,
-        isSocks: Boolean
+        isSocks: Boolean,
+        generation: Long
     ) {
         val tcpHeader = PacketUtils.parseTcpHeader(data, ipHeader.ihl) ?: return
         val flags = tcpHeader.flags
@@ -305,16 +457,53 @@ class TunVpnService : VpnService() {
                 }
             }
 
+            if (sessions.size >= MAX_ACTIVE_TCP_SESSIONS) {
+                Log.w(TAG, "Max active TCP sessions ($MAX_ACTIVE_TCP_SESSIONS) reached. Rejecting SYN for $key")
+                tunWriter?.write(PacketUtils.buildTcpPacket(
+                    srcIp = ipHeader.dstIp,
+                    dstIp = ipHeader.srcIp,
+                    srcPort = tcpHeader.dstPort,
+                    dstPort = tcpHeader.srcPort,
+                    seqNum = 0L,
+                    ackNum = (tcpHeader.seqNum + 1) and 0xFFFFFFFFL,
+                    flags = PacketUtils.TCP_RST or PacketUtils.TCP_ACK,
+                    windowSize = 0
+                ))
+                return
+            }
+
+            val currentSel = selector
             val session = TcpSession(
-                srcIp      = ipHeader.srcIp,
-                srcPort    = tcpHeader.srcPort,
-                dstIp      = ipHeader.dstIp,
-                dstPort    = tcpHeader.dstPort,
-                proxyIp    = proxyIp,
-                proxyPort  = proxyPort,
-                isSocks5   = isSocks,
-                vpnService = this,
-                tunWriter  = tunWriter ?: return
+                srcIp               = ipHeader.srcIp,
+                srcPort             = tcpHeader.srcPort,
+                dstIp               = ipHeader.dstIp,
+                dstPort             = tcpHeader.dstPort,
+                proxyIp             = proxyIp,
+                proxyPort           = proxyPort,
+                isSocks5            = isSocks,
+                vpnService          = this,
+                tunWriter           = tunWriter ?: return,
+                globalMemoryTracker = globalUploadBytes,
+                onEstablished       = { sess, channel ->
+                    val sel = currentSel
+                    if (sel != null && sel.isOpen && isRunning && tunGeneration.get() == generation) {
+                        try {
+                            val k = channel.register(sel, SelectionKey.OP_READ, sess)
+                            sess.selectionKey = k
+                            sess.selector = sel
+                            sess.updateInterestOps()
+                            sel.wakeup()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Selector registration failed for ${sess.key()}: ${e.message}", e)
+                            sess.sendRst()
+                            sess.close()
+                        }
+                    } else {
+                        Log.e(TAG, "Selector closed or stale generation during registration for ${sess.key()}")
+                        sess.sendRst()
+                        sess.close()
+                    }
+                }
             )
             sessions[key] = session
             session.handleSyn(tcpHeader.seqNum)
@@ -328,6 +517,8 @@ class TunVpnService : VpnService() {
             return
         }
 
+        val payload = PacketUtils.tcpPayload(data, ipHeader, tcpHeader)
+
         // RST
         if ((flags and PacketUtils.TCP_RST) != 0) {
             session.handleRst()
@@ -335,9 +526,9 @@ class TunVpnService : VpnService() {
             return
         }
 
-        // FIN
+        // FIN (may carry payload)
         if ((flags and PacketUtils.TCP_FIN) != 0) {
-            session.handleFin(tcpHeader)
+            session.handleFin(tcpHeader, payload)
             if (session.isDead) {
                 sessions.remove(key)
             }
@@ -345,11 +536,13 @@ class TunVpnService : VpnService() {
         }
 
         // DATA or plain ACK
-        val payload = PacketUtils.tcpPayload(data, ipHeader, tcpHeader)
         if (payload.isNotEmpty()) {
             session.handleData(tcpHeader, payload)
         } else {
             session.handleAck(tcpHeader)
+        }
+        if (session.isDead) {
+            sessions.remove(key)
         }
     }
 
@@ -414,14 +607,14 @@ class TunVpnService : VpnService() {
                         if (underlying != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP_MR1) {
                             try {
                                 setUnderlyingNetworks(arrayOf(underlying))
-                                com.example.netion.AppLogger.d("VPN", "Сеть переключена на: $underlying")
+                                com.example.netion.AppLogger.d("VPN", "Network switched to: $underlying")
                             } catch (_: Exception) {}
                         }
                     }
 
                     override fun onLost(network: Network) {
                         if (!isRunning) return
-                        com.example.netion.AppLogger.w("VPN", "Сетевое подключение потеряно: $network")
+                        com.example.netion.AppLogger.w("VPN", "Network connection lost: $network")
                     }
                 }
                 networkCallback = cb

@@ -328,7 +328,7 @@ private fun MainScaffold(
                             color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
                         ) {
                             Text(
-                                text       = "V.2.2.1",
+                                text       = "V2.3.15",
                                 fontSize   = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 color      = MaterialTheme.colorScheme.primary,

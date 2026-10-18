@@ -10,6 +10,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoMode
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
@@ -23,6 +24,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.netion.NetworkUtils
+import com.example.netion.qr.QrCodeDialog
 
 @Composable
 fun ServerScreen(
@@ -37,6 +39,7 @@ fun ServerScreen(
     val s = LocalStrings.current
     val hasTethering = serverIp != null
 
+    var showQrDialog by remember { mutableStateOf(false) }
     var showEditDialog by remember { mutableStateOf(false) }
     var showBusyPromptDialog by remember { mutableStateOf(false) }
     var suggestedHttpPort by remember { mutableIntStateOf(8081) }
@@ -67,7 +70,8 @@ fun ServerScreen(
                 ipLabel     = s.serverIpLabel,
                 httpLabel   = s.httpPortLabel,
                 socks5Label = s.socks5PortLabel,
-                onEditPorts = { showEditDialog = true }
+                onEditPorts = { showEditDialog = true },
+                onShowQr    = if (serverIp != null) { { showQrDialog = true } } else null
             )
         }
 
@@ -139,6 +143,15 @@ fun ServerScreen(
         }
 
         Spacer(Modifier.height(8.dp))
+    }
+
+    if (showQrDialog && serverIp != null) {
+        QrCodeDialog(
+            ip = serverIp,
+            httpPort = httpPort,
+            socks5Port = socks5Port,
+            onDismiss = { showQrDialog = false }
+        )
     }
 
     // ─── Диалог предупреждения о занятых портах ─────────────────
@@ -427,7 +440,8 @@ private fun IpPortCard(
     ipLabel: String,
     httpLabel: String,
     socks5Label: String,
-    onEditPorts: () -> Unit
+    onEditPorts: () -> Unit,
+    onShowQr: (() -> Unit)? = null
 ) {
     Card(
         modifier = Modifier
@@ -456,17 +470,36 @@ private fun IpPortCard(
                     }
                 }
 
-                if (!isRunning) {
-                    IconButton(
-                        onClick = onEditPorts,
-                        modifier = Modifier.size(28.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Edit,
-                            contentDescription = "Edit ports",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (!isRunning) {
+                        IconButton(
+                            onClick = onEditPorts,
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Edit,
+                                contentDescription = "Edit ports",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+
+                    if (onShowQr != null) {
+                        IconButton(
+                            onClick = onShowQr,
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.QrCode,
+                                contentDescription = "QR Code",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                     }
                 }
             }

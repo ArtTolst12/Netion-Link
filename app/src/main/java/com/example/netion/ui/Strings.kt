@@ -157,7 +157,20 @@ data class Strings(
     val ipHelpUsbTitle: String,
     val ipHelpUsbDesc: String,
     val ipChipAutoDetected: String,
-    val ipChipFallbackHotspot: String
+    val ipChipFallbackHotspot: String,
+
+    // About
+    val aboutAppTitle: String,
+    val aboutAppDesc: String,
+    val aboutAppSubtitle: String,
+    val aboutRepoTitle: String,
+    val aboutRepoDesc: String,
+    val aboutLicenseTitle: String,
+    val aboutLicenseDesc: String,
+    val aboutWarrantyTitle: String,
+    val aboutWarrantyDesc: String,
+    val aboutPrivacyTitle: String,
+    val aboutPrivacyDesc: String
 )
 
 val RuStrings = Strings(
@@ -273,7 +286,19 @@ val RuStrings = Strings(
     ipHelpUsbTitle = "USB-модем",
     ipHelpUsbDesc = "При подключении через USB используйте IP-адрес со вкладки «Сервер». Адрес 192.168.42.129 — лишь распространённый пример, он подходит не для всех устройств.",
     ipChipAutoDetected = "Авто / Точка доступа",
-    ipChipFallbackHotspot = "Резервный"
+    ipChipFallbackHotspot = "Резервный",
+
+    aboutAppTitle = "О программе",
+    aboutAppDesc = "Версия, лицензия, исходный код",
+    aboutAppSubtitle = "Раздача VPN и прокси-соединений между устройствами без Root-прав.",
+    aboutRepoTitle = "Репозиторий с открытым исходным кодом",
+    aboutRepoDesc = "Netion Link — свободное программное обеспечение. Вы можете изучать исходный код, сообщать об ошибках и следить за разработкой на GitHub.",
+    aboutLicenseTitle = "Лицензия",
+    aboutLicenseDesc = "Распространяется на условиях GNU Affero General Public License v3.0 (AGPL-3.0).\n\nЭта программа является свободным программным обеспечением: вы можете распространять и/или изменять её в соответствии с условиями лицензии GNU Affero General Public License, опубликованной Free Software Foundation, либо версии 3 лицензии, либо (по вашему выбору) любой более поздней версии.",
+    aboutWarrantyTitle = "Отказ от гарантий",
+    aboutWarrantyDesc = "Эта программа распространяется в надежде, что она будет полезной, но БЕЗ КАКИХ-ЛИБО ГАРАНТИЙ, в том числе без гарантий КОММЕРЧЕСКОЙ ЦЕННОСТИ или ПРИГОДНОСТИ ДЛЯ ОПРЕДЕЛЁННОЙ ЦЕЛИ. Подробнее см. в GNU Affero General Public License.",
+    aboutPrivacyTitle = "Конфиденциальность и сетевой трафик",
+    aboutPrivacyDesc = "Netion Link не использует собственные серверы или облачные сервисы. Приложение не собирает, не отслеживает и не передаёт персональные данные или телеметрию. Сетевой трафик пересылается исключительно через настроенный пользователем прокси/VPN на выбранные пользователем целевые ресурсы."
 )
 
 val EnStrings = Strings(
@@ -389,7 +414,19 @@ val EnStrings = Strings(
     ipHelpUsbTitle = "USB tethering",
     ipHelpUsbDesc = "When connected via USB, use the IP shown on the Server tab. 192.168.42.129 is only a common example and may not apply to your device.",
     ipChipAutoDetected = "Auto / Hotspot",
-    ipChipFallbackHotspot = "Fallback"
+    ipChipFallbackHotspot = "Fallback",
+
+    aboutAppTitle = "About",
+    aboutAppDesc = "Version, license, source code",
+    aboutAppSubtitle = "Share VPN and proxy connections between devices without Root permissions.",
+    aboutRepoTitle = "Open Source Repository",
+    aboutRepoDesc = "Netion Link is open source software. You can inspect the source code, report issues, and follow development on GitHub.",
+    aboutLicenseTitle = "License",
+    aboutLicenseDesc = "Distributed under the GNU Affero General Public License v3.0 (AGPL-3.0).\n\nThis program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.",
+    aboutWarrantyTitle = "Disclaimer of Warranty",
+    aboutWarrantyDesc = "This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.",
+    aboutPrivacyTitle = "Privacy & Network Notice",
+    aboutPrivacyDesc = "Netion Link does not operate its own servers or backend services. The application does not collect, track, or share personal data or network telemetry. Network traffic is forwarded through the user's configured proxy/VPN and onward through the networks and destination services selected by the user."
 )
 
 val DeStrings = Strings(
@@ -505,7 +542,19 @@ val DeStrings = Strings(
     ipHelpUsbTitle = "USB-Tethering",
     ipHelpUsbDesc = "Bei einer USB-Verbindung verwenden Sie die IP-Adresse aus dem Tab „Server“. 192.168.42.129 ist nur ein häufiges Beispiel und gilt nicht für jedes Gerät.",
     ipChipAutoDetected = "Auto / Hotspot",
-    ipChipFallbackHotspot = "Alternative"
+    ipChipFallbackHotspot = "Alternative",
+
+    aboutAppTitle = "Über die App",
+    aboutAppDesc = "Version, Lizenz, Quellcode",
+    aboutAppSubtitle = "VPN- und Proxy-Verbindungen zwischen Geräten ohne Root-Rechte teilen.",
+    aboutRepoTitle = "Open-Source-Repository",
+    aboutRepoDesc = "Netion Link ist Open-Source-Software. Sie können den Quellcode einsehen, Probleme melden und die Entwicklung auf GitHub verfolgen.",
+    aboutLicenseTitle = "Lizenz",
+    aboutLicenseDesc = "Verbreitet unter der GNU Affero General Public License v3.0 (AGPL-3.0).\n\nDieses Programm ist freie Software: Sie können es unter den Bedingungen der GNU Affero General Public License wie von der Free Software Foundation veröffentlicht weitergeben und/oder modifizieren, entweder gemäß Version 3 der Lizenz oder (nach Ihrer Option) jeder späteren Version.",
+    aboutWarrantyTitle = "Haftungsausschluss",
+    aboutWarrantyDesc = "Die Veröffentlichung dieses Programms erfolgt in der Hoffnung, dass es Ihnen von Nutzen sein wird, aber OHNE IRGENDEINE GARANTIE, sogar ohne die implizite Garantie der MARKTREIFE oder der VERWENDBARKEIT FÜR EINEN BESTIMMTEN ZWECK. Details finden Sie in der GNU Affero General Public License.",
+    aboutPrivacyTitle = "Datenschutz- und Netzwerkhinweis",
+    aboutPrivacyDesc = "Netion Link betreibt keine eigenen Server oder Backend-Dienste. Die Anwendung erfasst, verfolgt oder teilt keine personenbezogenen Daten oder Telemetrie. Der Netzwerkverkehr wird über den vom Benutzer konfigurierten Proxy/VPN weitergeleitet."
 )
 
 val FrStrings = Strings(
@@ -621,7 +670,19 @@ val FrStrings = Strings(
     ipHelpUsbTitle = "Partage de connexion USB",
     ipHelpUsbDesc = "En USB, utilisez l’adresse IP affichée dans l’onglet « Serveur ». 192.168.42.129 n’est qu’un exemple courant et ne convient pas à tous les appareils.",
     ipChipAutoDetected = "Auto / Point d’accès",
-    ipChipFallbackHotspot = "Secours"
+    ipChipFallbackHotspot = "Secours",
+
+    aboutAppTitle = "À propos",
+    aboutAppDesc = "Version, licence, code source",
+    aboutAppSubtitle = "Partagez des connexions VPN et proxy entre appareils sans droits Root.",
+    aboutRepoTitle = "Dépôt Open Source",
+    aboutRepoDesc = "Netion Link est un logiciel open source. Vous pouvez examiner le code source, signaler des problèmes et suivre le développement sur GitHub.",
+    aboutLicenseTitle = "Licence",
+    aboutLicenseDesc = "Distribué sous la licence GNU Affero General Public License v3.0 (AGPL-3.0).\n\nCe programme est un logiciel libre : vous pouvez le redistribuer et/ou le modifier selon les termes de la GNU Affero General Public License telle que publiée par la Free Software Foundation, soit la version 3 de la licence, soit (à votre convenance) toute version ultérieure.",
+    aboutWarrantyTitle = "Exclusion de garantie",
+    aboutWarrantyDesc = "Ce programme est distribué dans l'espoir qu'il sera utile, mais SANS AUCUNE GARANTIE, sans même la garantie implicite de COMMERCIALISATION ou d'ADÉQUATION À UN USAGE PARTICULIER. Consultez la GNU Affero General Public License pour plus de détails.",
+    aboutPrivacyTitle = "Avis de confidentialité et réseau",
+    aboutPrivacyDesc = "Netion Link n'exploite pas ses propres serveurs ni services backend. L'application ne collecte, ne suit ni ne partage de données personnelles ou de télémétrie. Le trafic réseau est acheminé via le proxy/VPN configuré par l'utilisateur."
 )
 
 val EsStrings = Strings(
@@ -736,7 +797,19 @@ val EsStrings = Strings(
     ipHelpUsbTitle = "Anclaje USB",
     ipHelpUsbDesc = "Si te conectas por USB, utiliza la IP que aparece en la pestaña «Servidor». 192.168.42.129 es solo un ejemplo habitual y puede no servir para tu dispositivo.",
     ipChipAutoDetected = "Auto / Zona Wi-Fi",
-    ipChipFallbackHotspot = "Alternativa"
+    ipChipFallbackHotspot = "Alternativa",
+
+    aboutAppTitle = "Acerca de",
+    aboutAppDesc = "Versión, licencia, código fuente",
+    aboutAppSubtitle = "Comparta conexiones VPN y proxy entre dispositivos sin permisos de Root.",
+    aboutRepoTitle = "Repositorio de código abierto",
+    aboutRepoDesc = "Netion Link es software de código abierto. Puede inspeccionar el código fuente, reportar problemas y seguir el desarrollo en GitHub.",
+    aboutLicenseTitle = "Licencia",
+    aboutLicenseDesc = "Distribuido bajo la GNU Affero General Public License v3.0 (AGPL-3.0).\n\nEste programa es software libre: puede redistribuirlo y/o modificarlo según los términos de la GNU Affero General Public License publicada por la Free Software Foundation, ya sea la versión 3 de la Licencia o (a su elección) cualquier versión posterior.",
+    aboutWarrantyTitle = "Exención de garantía",
+    aboutWarrantyDesc = "Este programa se distribuye con la esperanza de que sea útil, pero SIN NINGUNA GARANTÍA, incluso sin la garantía implícita de COMERCIABILIDAD o IDONEIDAD PARA UN PROPÓSITO PARTICULAR. Consulte la GNU Affero General Public License para más detalles.",
+    aboutPrivacyTitle = "Aviso de privacidad y red",
+    aboutPrivacyDesc = "Netion Link no opera sus propios servidores ni servicios backend. La aplicación no recopila, rastrea ni comparte datos personales ni telemetría. El tráfico de red se reenvía a través del proxy/VPN configurado por el usuario."
 )
 
 val PtStrings = Strings(
@@ -852,7 +925,19 @@ val PtStrings = Strings(
     ipHelpUsbTitle = "Partilha de ligação por USB",
     ipHelpUsbDesc = "Ao ligar por USB, utilize o IP apresentado no separador «Servidor». 192.168.42.129 é apenas um exemplo comum e pode não se aplicar ao seu dispositivo.",
     ipChipAutoDetected = "Auto / Hotspot",
-    ipChipFallbackHotspot = "Alternativa"
+    ipChipFallbackHotspot = "Alternativa",
+
+    aboutAppTitle = "Sobre o app",
+    aboutAppDesc = "Versão, licença, código fonte",
+    aboutAppSubtitle = "Compartilhe conexões VPN e proxy entre dispositivos sem permissões de Root.",
+    aboutRepoTitle = "Repositório de código aberto",
+    aboutRepoDesc = "O Netion Link é um software de código aberto. Você pode inspecionar o código-fonte, relatar problemas e acompanhar o desenvolvimento no GitHub.",
+    aboutLicenseTitle = "Licença",
+    aboutLicenseDesc = "Distribuído sob a GNU Affero General Public License v3.0 (AGPL-3.0).\n\nEste programa é software livre: você pode redistribuí-lo e/ou modificá-lo sob os termos da GNU Affero General Public License publicada pela Free Software Foundation, versão 3 da Licença ou (à sua opção) qualquer versão posterior.",
+    aboutWarrantyTitle = "Isenção de garantia",
+    aboutWarrantyDesc = "Este programa é distribuído na expectativa de ser útil, mas SEM QUALQUER GARANTIA; sem mesmo a garantia implícita de COMERCIALIZAÇÃO ou de ADEQUAÇÃO A DETERMINADO PROPÓSITO. Veja a GNU Affero General Public License para mais detalhes.",
+    aboutPrivacyTitle = "Aviso de privacidade e rede",
+    aboutPrivacyDesc = "O Netion Link não opera servidores próprios nem serviços de backend. O aplicativo não coleta, rastreia nem compartilha dados pessoais ou telemetria. O tráfego de rede é encaminhado através do proxy/VPN configurado pelo usuário."
 )
 
 val PlStrings = Strings(
@@ -968,7 +1053,19 @@ val PlStrings = Strings(
     ipHelpUsbTitle = "Tethering USB",
     ipHelpUsbDesc = "Przy połączeniu przez USB użyj adresu IP widocznego na karcie „Serwer”. 192.168.42.129 to tylko często spotykany przykład i nie musi pasować do Twojego urządzenia.",
     ipChipAutoDetected = "Auto / Hotspot",
-    ipChipFallbackHotspot = "Zapasowy"
+    ipChipFallbackHotspot = "Zapasowy",
+
+    aboutAppTitle = "O programie",
+    aboutAppDesc = "Wersja, licencja, kod źródłowy",
+    aboutAppSubtitle = "Udostępniaj połączenia VPN i proxy między urządzeniami bez uprawnień Root.",
+    aboutRepoTitle = "Repozytorium open source",
+    aboutRepoDesc = "Netion Link to oprogramowanie open source. Możesz przeglądać kod źródłowy, zgłaszać błędy i śledzić rozwój na GitHubie.",
+    aboutLicenseTitle = "Licencja",
+    aboutLicenseDesc = "Dystrybuowany na warunkach licencji GNU Affero General Public License v3.0 (AGPL-3.0).\n\nTen program jest wolnym oprogramowaniem: możesz go redystrybuować i/lub modyfikować zgodnie z warunkami licencji GNU Affero General Public License opublikowanej przez Free Software Foundation, w wersji 3 lub (według własnego wyboru) dowolnej późniejszej.",
+    aboutWarrantyTitle = "Wyłączenie gwarancji",
+    aboutWarrantyDesc = "Niniejszy program rozpowszechniany jest z nadzieją, że będzie użyteczny, ale BEZ JAKIEJKOLWIEK GWARANCJI, nawet bez domniemanej gwarancji PRZYDATNOŚCI HANDLOWEJ lub PRZYDATNOŚCI DO OKREŚLONEGO CELU. Szczegóły znajdziesz w licencji GNU Affero General Public License.",
+    aboutPrivacyTitle = "Prywatność i sieć",
+    aboutPrivacyDesc = "Netion Link nie posiada własnych serwerów ani usług backendowych. Aplikacja nie zbiera, nie śledzi ani nie udostępnia danych osobowych ani telemetrii. Ruch sieciowy jest przesyłany wyłącznie przez proxy/VPN skonfigurowany przez użytkownika."
 )
 
 val ZhStrings = Strings(
@@ -1084,7 +1181,19 @@ val ZhStrings = Strings(
     ipHelpUsbTitle = "USB 网络共享",
     ipHelpUsbDesc = "通过 USB 连接时，请使用“服务端”页面显示的 IP。192.168.42.129 只是常见示例，并非适用于所有设备。",
     ipChipAutoDetected = "自动 / 热点",
-    ipChipFallbackHotspot = "备用"
+    ipChipFallbackHotspot = "备用",
+
+    aboutAppTitle = "关于应用",
+    aboutAppDesc = "版本、许可证、源代码",
+    aboutAppSubtitle = "无需 Root 权限即可在设备之间共享 VPN 和代理连接。",
+    aboutRepoTitle = "开源代码仓库",
+    aboutRepoDesc = "Netion Link 是一款开源软件。您可以在 GitHub 上查看源代码、报告问题并关注开发动态。",
+    aboutLicenseTitle = "许可证",
+    aboutLicenseDesc = "根据 GNU Affero 通用公共许可证 v3.0 (AGPL-3.0) 分发。\n\n本程序为自由软件：您可以根据自由软件基金会发布的 GNU Affero 通用公共许可证（许可证的第 3 版或（根据您的选择）任何更高版本）的条款重新分发和/或修改它。",
+    aboutWarrantyTitle = "免责声明",
+    aboutWarrantyDesc = "发布本程序是希望它能发挥作用，但不提供任何保证，甚至不包含对适销性或特定用途适用性的暗示保证。详情请参阅 GNU Affero 通用公共许可证。",
+    aboutPrivacyTitle = "隐私与网络说明",
+    aboutPrivacyDesc = "Netion Link 不运营任何自己的服务器或后端服务。本应用不会收集、跟踪或共享个人数据或网络遥测数据。网络流量仅通过用户配置的代理/VPN 以及用户选择的目标服务进行转发。"
 )
 
 val JaStrings = Strings(
@@ -1200,7 +1309,19 @@ val JaStrings = Strings(
     ipHelpUsbTitle = "USBテザリング",
     ipHelpUsbDesc = "USB接続では、「サーバー」タブに表示されたIPを使用してください。192.168.42.129は一般的な例で、すべての端末で使えるとは限りません。",
     ipChipAutoDetected = "自動 / テザリング",
-    ipChipFallbackHotspot = "予備"
+    ipChipFallbackHotspot = "予備",
+
+    aboutAppTitle = "アプリについて",
+    aboutAppDesc = "バージョン、ライセンス、ソースコード",
+    aboutAppSubtitle = "Root権限なしでデバイス間でVPNおよびプロキシ接続を共有します。",
+    aboutRepoTitle = "オープンソースリポジトリ",
+    aboutRepoDesc = "Netion Link はオープンソースソフトウェアです。GitHubでソースコードの確認、問題の報告、開発の追跡ができます。",
+    aboutLicenseTitle = "ライセンス",
+    aboutLicenseDesc = "GNU Affero General Public License v3.0 (AGPL-3.0) に基づいて配布されています。\n\nこのプログラムはフリーソフトウェアです。Free Software Foundation が公開した GNU Affero General Public License（バージョン3またはそれ以降のバージョン）の条件に従って再配布および改変が可能です。",
+    aboutWarrantyTitle = "保証の否認",
+    aboutWarrantyDesc = "このプログラムは有用であることを期待して配布されますが、商品性や特定の目的への適合性の黙示の保証を含め、いかなる保証もありません。詳細は GNU Affero General Public License を参照してください。",
+    aboutPrivacyTitle = "プライバシーとネットワークに関する通知",
+    aboutPrivacyDesc = "Netion Link は独自のサーバーやバックエンドサービスを運用していません。本アプリは個人データやネットワークテレメトリを収集、追跡、共有しません。トラフィックはユーザーが設定したプロキシ/VPN経由でのみ転送されます。"
 )
 
 val KoStrings = Strings(
@@ -1316,7 +1437,19 @@ val KoStrings = Strings(
     ipHelpUsbTitle = "USB 테더링",
     ipHelpUsbDesc = "USB로 연결할 때는 ‘서버’ 탭에 표시된 IP를 사용하세요. 192.168.42.129는 흔한 예시일 뿐이며 모든 기기에 적용되는 것은 아닙니다.",
     ipChipAutoDetected = "자동 / 핫스팟",
-    ipChipFallbackHotspot = "예비"
+    ipChipFallbackHotspot = "예비",
+
+    aboutAppTitle = "앱 정보",
+    aboutAppDesc = "버전, 라이선스, 소스 코드",
+    aboutAppSubtitle = "Root 권한 없이 기기 간에 VPN 및 프록시 연결을 공유합니다.",
+    aboutRepoTitle = "오픈 소스 저장소",
+    aboutRepoDesc = "Netion Link는 오픈 소스 소프트웨어입니다. GitHub에서 소스 코드를 확인하고 문제를 보고하며 개발 상황을 확인할 수 있습니다.",
+    aboutLicenseTitle = "라이선스",
+    aboutLicenseDesc = "GNU Affero General Public License v3.0 (AGPL-3.0)에 따라 배포됩니다.\n\n이 프로그램은 자유 소프트웨어입니다. Free Software Foundation에서 게시한 GNU Affero General Public License(버전 3 또는 선택에 따라 그 이후 버전)의 조항에 따라 재배포 및 수정할 수 있습니다.",
+    aboutWarrantyTitle = "보증의 부인",
+    aboutWarrantyDesc = "이 프로그램은 유용할 것이라는 희망으로 배포되지만, 상품성 또는 특정 목적에 대한 적합성에 대한 묵시적 보증을 포함하여 어떠한 보증도 제공하지 않습니다. 자세한 내용은 GNU Affero General Public License를 참조하십시오.",
+    aboutPrivacyTitle = "개인정보 및 네트워크 안내",
+    aboutPrivacyDesc = "Netion Link는 자체 서버나 백엔드 서비스를 운영하지 않습니다. 애플리케이션은 개인 데이터나 네트워크 원격 측정을 수집, 추적 또는 공유하지 않습니다. 네트워크 트래픽은 사용자가 구성한 프록시/VPN을 통해서만 전달됩니다."
 )
 
 val LocalStrings = compositionLocalOf { RuStrings }

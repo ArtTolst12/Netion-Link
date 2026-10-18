@@ -8,8 +8,12 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -30,6 +34,8 @@ class ProxyServer(
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val IDLE_TIMEOUT_MS = 120_000 // 2 minutes idle read timeout
         private const val MAX_LINE_LENGTH = 8192 // Limit HTTP line length to protect against OOM
+        private const val MAX_HEADERS_COUNT = 100 // Limit number of HTTP header lines to protect against slowloris
+        private const val HANDSHAKE_DEADLINE_MS = 10_000L // Overall deadline for HTTP headers / SOCKS5 handshake
         private const val MAX_CONCURRENT_CONNECTIONS = 256
     }
 
@@ -43,13 +49,41 @@ class ProxyServer(
         private set
 
     var onPortReallocated: ((httpPort: Int, socksPort: Int) -> Unit)? = null
+    var clientFilter: ((InetAddress) -> Boolean)? = null
+    var handshakeDeadlineMs: Long = HANDSHAKE_DEADLINE_MS
+    var maxConcurrentConnections: Int = MAX_CONCURRENT_CONNECTIONS
 
     private var httpServerSocket: ServerSocket? = null
     private var socksServerSocket: ServerSocket? = null
     private val running = AtomicBoolean(false)
-    private val pool: ExecutorService = Executors.newCachedThreadPool()
+
+    // Bounded thread pool for accept workers and tunnel directions
+    private val pool: ExecutorService = ThreadPoolExecutor(
+        0,
+        MAX_CONCURRENT_CONNECTIONS * 2 + 8,
+        60L, TimeUnit.SECONDS,
+        SynchronousQueue<Runnable>(),
+        ThreadPoolExecutor.AbortPolicy()
+    )
+
+    // Atomic connection slot reservation
+    private val activeConnectionSlots = AtomicInteger(0)
     private val activeSockets = java.util.concurrent.ConcurrentHashMap.newKeySet<Socket>()
     val activeSocketsCount: Int get() = activeSockets.size
+    val activeClientConnectionsCount: Int get() = activeConnectionSlots.get()
+
+    /**
+     * Single-use lease guaranteeing atomic acquisition and strictly once-only release
+     * of connection slots across all phases (handshake, errors, and bidirectional data piping).
+     */
+    private class ConnectionSlotLease(private val counter: AtomicInteger) {
+        private val released = AtomicBoolean(false)
+        fun release() {
+            if (released.compareAndSet(false, true)) {
+                counter.updateAndGet { if (it > 0) it - 1 else 0 }
+            }
+        }
+    }
 
     val totalBytesTx = java.util.concurrent.atomic.AtomicLong(0L)
     val totalBytesRx = java.util.concurrent.atomic.AtomicLong(0L)
@@ -76,24 +110,48 @@ class ProxyServer(
                     bind(InetSocketAddress(httpPort))
                 }
                 Log.i(TAG, "Proxy HTTP listener started on port $httpPort")
-                AppLogger.s("Server", "HTTP слушатель запущен на порту $httpPort")
+                AppLogger.s("Server", "HTTP listener started on port $httpPort")
 
                 if (httpPortReallocated || socksPortReallocated) {
                     onPortReallocated?.invoke(httpPort, socks5Port)
                 }
 
                 while (running.get()) {
+                    val client: Socket
                     try {
-                        val client = httpServerSocket?.accept() ?: break
-                        AppLogger.i("Server", "Входящее HTTP соединение от ${client.remoteSocketAddress}")
-                        pool.execute { handleClient(client) }
+                        client = httpServerSocket?.accept() ?: break
                     } catch (e: Exception) {
                         if (running.get()) Log.w(TAG, "HTTP accept error: ${e.message}")
+                        continue
+                    }
+
+                    if (!running.get()) {
+                        try { client.close() } catch (_: Exception) {}
+                        break
+                    }
+
+                    if (activeConnectionSlots.incrementAndGet() > maxConcurrentConnections) {
+                        activeConnectionSlots.decrementAndGet()
+                        Log.w(TAG, "Connection limit ($maxConcurrentConnections) reached. Rejecting HTTP client from ${client.remoteSocketAddress}")
+                        AppLogger.w("Server", "Connection limit ($maxConcurrentConnections) reached. Rejecting HTTP client.")
+                        try { client.close() } catch (_: Exception) {}
+                        continue
+                    }
+
+                    val lease = ConnectionSlotLease(activeConnectionSlots)
+                    try {
+                        pool.execute {
+                            handleClient(client, lease)
+                        }
+                    } catch (e: RejectedExecutionException) {
+                        lease.release()
+                        Log.w(TAG, "Worker pool saturated. Rejecting HTTP client from ${client.remoteSocketAddress}")
+                        try { client.close() } catch (_: Exception) {}
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to bind HTTP port $httpPort: ${e.message}")
-                AppLogger.e("Server", "Ошибка привязки HTTP порта $httpPort: ${e.message}")
+                AppLogger.e("Server", "Failed to bind HTTP port $httpPort: ${e.message}")
             }
         }
 
@@ -116,24 +174,48 @@ class ProxyServer(
                     bind(InetSocketAddress(socks5Port))
                 }
                 Log.i(TAG, "Proxy SOCKS5 listener started on port $socks5Port")
-                AppLogger.s("Server", "SOCKS5 слушатель запущен на порту $socks5Port")
+                AppLogger.s("Server", "SOCKS5 listener started on port $socks5Port")
 
                 if (httpPortReallocated || socksPortReallocated) {
                     onPortReallocated?.invoke(httpPort, socks5Port)
                 }
 
                 while (running.get()) {
+                    val client: Socket
                     try {
-                        val client = socksServerSocket?.accept() ?: break
-                        AppLogger.i("Server", "Входящее SOCKS5 соединение от ${client.remoteSocketAddress}")
-                        pool.execute { handleClient(client) }
+                        client = socksServerSocket?.accept() ?: break
                     } catch (e: Exception) {
                         if (running.get()) Log.w(TAG, "SOCKS5 accept error: ${e.message}")
+                        continue
+                    }
+
+                    if (!running.get()) {
+                        try { client.close() } catch (_: Exception) {}
+                        break
+                    }
+
+                    if (activeConnectionSlots.incrementAndGet() > maxConcurrentConnections) {
+                        activeConnectionSlots.decrementAndGet()
+                        Log.w(TAG, "Connection limit ($maxConcurrentConnections) reached. Rejecting SOCKS5 client from ${client.remoteSocketAddress}")
+                        AppLogger.w("Server", "Connection limit ($maxConcurrentConnections) reached. Rejecting SOCKS5 client.")
+                        try { client.close() } catch (_: Exception) {}
+                        continue
+                    }
+
+                    val lease = ConnectionSlotLease(activeConnectionSlots)
+                    try {
+                        pool.execute {
+                            handleClient(client, lease)
+                        }
+                    } catch (e: RejectedExecutionException) {
+                        lease.release()
+                        Log.w(TAG, "Worker pool saturated. Rejecting SOCKS5 client from ${client.remoteSocketAddress}")
+                        try { client.close() } catch (_: Exception) {}
                     }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to bind SOCKS5 port $socks5Port: ${e.message}")
-                AppLogger.e("Server", "Ошибка привязки SOCKS5 порта $socks5Port: ${e.message}")
+                AppLogger.e("Server", "Failed to bind SOCKS5 port $socks5Port: ${e.message}")
             }
         }
     }
@@ -150,6 +232,7 @@ class ProxyServer(
             try { s.close() } catch (_: Exception) {}
         }
         activeSockets.clear()
+        activeConnectionSlots.set(0)
 
         pool.shutdownNow()
         Log.i(TAG, "Proxy stopped")
@@ -161,14 +244,32 @@ class ProxyServer(
     // Client handler & protocol detection
     // ──────────────────────────────────────────────────────────────
 
-    private fun handleClient(client: Socket) {
-        if (!running.get() || activeSockets.size >= MAX_CONCURRENT_CONNECTIONS) {
+    private fun handleClient(client: Socket, lease: ConnectionSlotLease) {
+        if (!running.get()) {
             try { client.close() } catch (_: Exception) {}
+            lease.release()
             return
         }
+
+        val remoteAddr = client.inetAddress
+        if (remoteAddr != null && clientFilter?.invoke(remoteAddr) == false) {
+            Log.w(TAG, "Rejected client from unauthorized network address: $remoteAddr")
+            AppLogger.w("Server", "Rejected unauthorized client from $remoteAddr")
+            try { client.close() } catch (_: Exception) {}
+            lease.release()
+            return
+        }
+
         activeSockets.add(client)
+        if (!running.get()) {
+            closeQuietly(client)
+            lease.release()
+            return
+        }
+
         try {
-            client.soTimeout = 15_000
+            val deadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(handshakeDeadlineMs)
+            updateSoTimeoutWithDeadline(client, deadlineNano)
             client.tcpNoDelay = true
             client.keepAlive = true
             val input  = client.getInputStream()
@@ -178,19 +279,21 @@ class ProxyServer(
             val firstByte = input.read()
             if (firstByte == -1) {
                 closeQuietly(client)
+                lease.release()
                 return
             }
 
             if (firstByte == 5) {
                 // SOCKS5 protocol
-                handleSocks5(client, input, output)
+                handleSocks5(client, input, output, deadlineNano, lease)
             } else {
                 // HTTP / CONNECT protocol
-                handleHttpOrConnect(firstByte, client, input, output)
+                handleHttpOrConnect(firstByte, client, input, output, deadlineNano, lease)
             }
         } catch (e: Exception) {
             Log.d(TAG, "Client error: ${e.message}")
             closeQuietly(client)
+            lease.release()
         }
     }
 
@@ -198,30 +301,57 @@ class ProxyServer(
     // SOCKS5 Handler (RFC 1928)
     // ──────────────────────────────────────────────────────────────
 
-    private fun handleSocks5(client: Socket, input: InputStream, output: OutputStream) {
+    private fun handleSocks5(
+        client: Socket,
+        input: InputStream,
+        output: OutputStream,
+        deadlineNano: Long,
+        lease: ConnectionSlotLease
+    ) {
         try {
             // 1. Authentication Negotiation
             // Version 0x05 was already read. Read number of methods.
+            updateSoTimeoutWithDeadline(client, deadlineNano)
             val nmethods = input.read()
             if (nmethods <= 0) {
                 closeQuietly(client)
+                lease.release()
                 return
             }
             val methods = ByteArray(nmethods)
-            readFully(input, methods)
+            readFully(client, input, methods, deadlineNano)
+
+            // RFC 1928: Verify if method 0x00 (NO AUTHENTICATION REQUIRED) was offered
+            val supportsNoAuth = methods.any { it == 0x00.toByte() }
+            if (!supportsNoAuth) {
+                Log.w(TAG, "SOCKS5 client did not offer NO AUTHENTICATION REQUIRED (0x00)")
+                try {
+                    // 0xFF = NO ACCEPTABLE METHODS
+                    output.write(byteArrayOf(0x05, 0xFF.toByte()))
+                    output.flush()
+                } catch (_: Exception) {}
+                closeQuietly(client)
+                lease.release()
+                return
+            }
 
             // Reply: Version 5, Method 0x00 (NO AUTHENTICATION REQUIRED)
             output.write(byteArrayOf(0x05, 0x00))
             output.flush()
 
             // 2. SOCKS5 Request
+            updateSoTimeoutWithDeadline(client, deadlineNano)
             val ver = input.read()
             if (ver != 5) {
                 closeQuietly(client)
+                lease.release()
                 return
             }
+            updateSoTimeoutWithDeadline(client, deadlineNano)
             val cmd = input.read()
+            updateSoTimeoutWithDeadline(client, deadlineNano)
             input.read() // RSV (reserved, 0x00)
+            updateSoTimeoutWithDeadline(client, deadlineNano)
             val atyp = input.read()
 
             // Only CMD 0x01 (CONNECT) is supported for TCP proxying
@@ -232,6 +362,7 @@ class ProxyServer(
                     output.flush()
                 } catch (_: Exception) {}
                 closeQuietly(client)
+                lease.release()
                 return
             }
 
@@ -239,25 +370,28 @@ class ProxyServer(
             when (atyp) {
                 1 -> { // IPv4 (4 bytes)
                     val ip = ByteArray(4)
-                    readFully(input, ip)
+                    readFully(client, input, ip, deadlineNano)
                     targetHost = "${ip[0].toInt() and 0xFF}.${ip[1].toInt() and 0xFF}." +
                                  "${ip[2].toInt() and 0xFF}.${ip[3].toInt() and 0xFF}"
                 }
                 3 -> { // Domain name (1 byte length + ASCII bytes)
+                    updateSoTimeoutWithDeadline(client, deadlineNano)
                     val len = input.read()
                     if (len <= 0) {
                         closeQuietly(client)
+                        lease.release()
                         return
                     }
                     val dom = ByteArray(len)
-                    readFully(input, dom)
+                    readFully(client, input, dom, deadlineNano)
                     targetHost = String(dom, Charsets.UTF_8)
                 }
                 4 -> { // IPv6 (16 bytes)
                     val ip6 = ByteArray(16)
-                    readFully(input, ip6)
+                    readFully(client, input, ip6, deadlineNano)
                     targetHost = InetAddress.getByAddress(ip6).hostAddress ?: run {
                         closeQuietly(client)
+                        lease.release()
                         return
                     }
                 }
@@ -268,38 +402,37 @@ class ProxyServer(
                         output.flush()
                     } catch (_: Exception) {}
                     closeQuietly(client)
+                    lease.release()
                     return
                 }
             }
 
-            val p1 = input.read()
-            val p2 = input.read()
-            if (p1 < 0 || p2 < 0) {
-                closeQuietly(client)
-                return
-            }
-            val targetPort = ((p1 and 0xFF) shl 8) or (p2 and 0xFF)
+            val pBuf = ByteArray(2)
+            readFully(client, input, pBuf, deadlineNano)
+            val p1 = pBuf[0].toInt() and 0xFF
+            val p2 = pBuf[1].toInt() and 0xFF
+            val targetPort = (p1 shl 8) or p2
 
             // 3. Connect to destination
             var remote: Socket? = null
             try {
                 Log.i(TAG, "SOCKS5 connecting upstream to $targetHost:$targetPort...")
-                AppLogger.i("Server", "SOCKS5 запрос к $targetHost:$targetPort (от ${client.remoteSocketAddress})")
+                AppLogger.i("Server", "SOCKS5 request to $targetHost:$targetPort (from ${client.remoteSocketAddress})")
                 remote = Socket()
                 remote.tcpNoDelay = true
                 remote.connect(InetSocketAddress(targetHost, targetPort), CONNECT_TIMEOUT_MS)
                 Log.i(TAG, "SOCKS5 upstream connected successfully to $targetHost:$targetPort")
-                AppLogger.s("Server", "Успешное соединение с $targetHost:$targetPort через внешний VPN")
+                AppLogger.s("Server", "Connected to $targetHost:$targetPort via upstream VPN")
 
                 // 4. Send success response: VER=5, REP=0, RSV=0, ATYP=1, BND.ADDR=0.0.0.0, BND.PORT=0
                 output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
                 output.flush()
 
                 // 5. Bidirectional tunnel
-                tunnelAndClose(client, remote)
+                tunnelAndClose(client, remote, lease)
             } catch (e: Exception) {
                 Log.e(TAG, "SOCKS5 connect failed for $targetHost:$targetPort: [${e.javaClass.simpleName}] ${e.message}", e)
-                AppLogger.e("Server", "Ошибка подключения к $targetHost:$targetPort: ${e.message}")
+                AppLogger.e("Server", "Connection error to $targetHost:$targetPort: ${e.message}")
                 try {
                     // 0x05 = Connection refused
                     output.write(byteArrayOf(0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0))
@@ -307,11 +440,13 @@ class ProxyServer(
                 } catch (_: Exception) {}
                 closeQuietly(remote)
                 closeQuietly(client)
+                lease.release()
             }
         } catch (e: Exception) {
             Log.e(TAG, "SOCKS5 handshake error: [${e.javaClass.simpleName}] ${e.message}", e)
-            AppLogger.e("Server", "SOCKS5 ошибка handshake: ${e.message}")
+            AppLogger.e("Server", "SOCKS5 handshake error: ${e.message}")
             closeQuietly(client)
+            lease.release()
         }
     }
 
@@ -319,66 +454,106 @@ class ProxyServer(
     // HTTP / CONNECT Handler
     // ──────────────────────────────────────────────────────────────
 
-    private fun handleHttpOrConnect(firstByte: Int, client: Socket, input: InputStream, output: OutputStream) {
-        val restOfLine = readLine(input) ?: run {
+    private fun handleHttpOrConnect(
+        firstByte: Int,
+        client: Socket,
+        input: InputStream,
+        output: OutputStream,
+        deadlineNano: Long,
+        lease: ConnectionSlotLease
+    ) {
+        val restOfLine = readLine(client, input, deadlineNano) ?: run {
             closeQuietly(client)
+            lease.release()
             return
         }
         val firstLine = "${firstByte.toChar()}$restOfLine"
         val parts = firstLine.trim().split(" ")
         if (parts.size < 3) {
             closeQuietly(client)
+            lease.release()
             return
         }
 
         val method = parts[0].uppercase()
         if (method == "CONNECT") {
-            handleConnect(parts[1], client, input, output)
+            handleConnect(parts[1], client, input, output, deadlineNano, lease)
         } else {
-            handleHttp(firstLine, method, client, input, output)
+            handleHttp(firstLine, method, client, input, output, deadlineNano, lease)
         }
     }
 
     /** HTTPS tunnel via CONNECT */
-    private fun handleConnect(hostPort: String, client: Socket, input: InputStream, output: OutputStream) {
+    private fun handleConnect(
+        hostPort: String,
+        client: Socket,
+        input: InputStream,
+        output: OutputStream,
+        deadlineNano: Long,
+        lease: ConnectionSlotLease
+    ) {
         val (host, port) = parseHostPort(hostPort, 443)
 
-        // Consume remaining headers
-        drainHeaders(input)
+        // Consume remaining headers within deadline and count limits
+        if (!drainHeaders(client, input, deadlineNano)) {
+            closeQuietly(client)
+            lease.release()
+            return
+        }
 
         var remote: Socket? = null
         try {
             Log.i(TAG, "HTTP CONNECT connecting upstream to $host:$port...")
-            AppLogger.i("Server", "HTTP CONNECT запрос к $host:$port (от ${client.remoteSocketAddress})")
+            AppLogger.i("Server", "HTTP CONNECT request to $host:$port (from ${client.remoteSocketAddress})")
             remote = Socket()
             remote.tcpNoDelay = true
             remote.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
             Log.i(TAG, "HTTP CONNECT upstream connected successfully to $host:$port")
-            AppLogger.s("Server", "Успешное соединение с $host:$port через внешний VPN")
+            AppLogger.s("Server", "Connected to $host:$port via upstream VPN")
 
             output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
             output.flush()
 
-            tunnelAndClose(client, remote)
+            tunnelAndClose(client, remote, lease)
         } catch (e: Exception) {
             Log.e(TAG, "CONNECT failed for $host:$port: [${e.javaClass.simpleName}] ${e.message}", e)
-            AppLogger.e("Server", "HTTP CONNECT ошибка для $host:$port: ${e.message}")
+            AppLogger.e("Server", "HTTP CONNECT error for $host:$port: ${e.message}")
             try {
                 output.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
                 output.flush()
             } catch (_: Exception) {}
             closeQuietly(remote)
             closeQuietly(client)
+            lease.release()
         }
     }
 
     /** Plain HTTP forwarding */
-    private fun handleHttp(firstLine: String, method: String, client: Socket, input: InputStream, output: OutputStream) {
+    private fun handleHttp(
+        firstLine: String,
+        method: String,
+        client: Socket,
+        input: InputStream,
+        output: OutputStream,
+        deadlineNano: Long,
+        lease: ConnectionSlotLease
+    ) {
         val headers = StringBuilder(firstLine).append("\r\n")
         var host = ""
+        var lineCount = 1
         while (true) {
-            val line = readLine(input) ?: break
+            val line = readLine(client, input, deadlineNano) ?: run {
+                closeQuietly(client)
+                lease.release()
+                return
+            }
             if (line.isEmpty()) break
+            lineCount++
+            if (lineCount > MAX_HEADERS_COUNT) {
+                closeQuietly(client)
+                lease.release()
+                return
+            }
             headers.append(line).append("\r\n")
             if (line.lowercase().startsWith("host:")) {
                 host = line.substringAfter(":").trim()
@@ -388,6 +563,7 @@ class ProxyServer(
 
         if (host.isEmpty()) {
             closeQuietly(client)
+            lease.release()
             return
         }
 
@@ -401,7 +577,7 @@ class ProxyServer(
             remote.getOutputStream().write(headers.toString().toByteArray())
             remote.getOutputStream().flush()
 
-            tunnelAndClose(client, remote)
+            tunnelAndClose(client, remote, lease)
         } catch (e: Exception) {
             Log.w(TAG, "HTTP forward failed for $remoteHost:$remotePort: ${e.message}")
             try {
@@ -410,6 +586,7 @@ class ProxyServer(
             } catch (_: Exception) {}
             closeQuietly(remote)
             closeQuietly(client)
+            lease.release()
         }
     }
 
@@ -417,9 +594,17 @@ class ProxyServer(
     // Utilities
     // ──────────────────────────────────────────────────────────────
 
-    private fun tunnelAndClose(client: Socket, remote: Socket) {
+    private fun tunnelAndClose(client: Socket, remote: Socket, lease: ConnectionSlotLease) {
         activeSockets.add(client)
         activeSockets.add(remote)
+
+        // Guard against stop() race window immediately after socket registration
+        if (!running.get()) {
+            closeQuietly(client)
+            closeQuietly(remote)
+            lease.release()
+            return
+        }
 
         // Set idle timeout and enable TCP KeepAlive
         try {
@@ -441,6 +626,7 @@ class ProxyServer(
             if (closedBoth.compareAndSet(false, true)) {
                 closeQuietly(client)
                 closeQuietly(remote)
+                lease.release()
             }
         }
 
@@ -502,19 +688,30 @@ class ProxyServer(
         }
     }
 
-    private fun readFully(input: InputStream, b: ByteArray) {
+    private fun updateSoTimeoutWithDeadline(socket: Socket, deadlineNano: Long) {
+        val remainingNanos = deadlineNano - System.nanoTime()
+        if (remainingNanos <= 0) {
+            throw SocketTimeoutException("Handshake deadline exceeded")
+        }
+        val remainingMs = (remainingNanos / 1_000_000L).coerceIn(1L, 15_000L).toInt()
+        socket.soTimeout = remainingMs
+    }
+
+    private fun readFully(socket: Socket, input: InputStream, b: ByteArray, deadlineNano: Long) {
         var total = 0
         while (total < b.size) {
+            updateSoTimeoutWithDeadline(socket, deadlineNano)
             val count = input.read(b, total, b.size - total)
             if (count < 0) throw java.io.EOFException("Premature EOF")
             total += count
         }
     }
 
-    private fun readLine(input: InputStream): String? {
+    private fun readLine(socket: Socket, input: InputStream, deadlineNano: Long): String? {
         val sb = StringBuilder()
         var prev = -1
         while (true) {
+            updateSoTimeoutWithDeadline(socket, deadlineNano)
             val b = input.read()
             if (b == -1) return if (sb.isEmpty()) null else sb.toString()
             if (b == '\n'.code && prev == '\r'.code) {
@@ -528,10 +725,13 @@ class ProxyServer(
         }
     }
 
-    private fun drainHeaders(input: InputStream) {
+    private fun drainHeaders(socket: Socket, input: InputStream, deadlineNano: Long): Boolean {
+        var count = 0
         while (true) {
-            val line = readLine(input) ?: break
-            if (line.isEmpty()) break
+            val line = readLine(socket, input, deadlineNano) ?: return false
+            if (line.isEmpty()) return true
+            count++
+            if (count > MAX_HEADERS_COUNT) return false
         }
     }
 
