@@ -25,7 +25,11 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.arttolst12.netion.qr.ProxyProtocol
+import io.github.arttolst12.netion.qr.QrPayload
 import io.github.arttolst12.netion.qr.QrScannerDialog
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun ClientScreen(
@@ -35,12 +39,31 @@ fun ClientScreen(
     isServerRunning: Boolean = false,
     onProxyIpChange: (String) -> Unit,
     onProxyPortChange: (String) -> Unit,
-    onConnectWith: ((ip: String, port: Int) -> Unit)? = null,
-    onToggleVpn: () -> Unit
+    onConnectWith: ((QrPayload) -> Unit)? = null,
+    onToggleVpn: (ProxyProtocol) -> Unit,
+    isStarting: Boolean = false
 ) {
     val s = LocalStrings.current
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var gatewayIp by remember(context) { mutableStateOf<String?>(null) }
+    LaunchedEffect(context) {
+        gatewayIp = withContext(Dispatchers.IO) {
+            io.github.arttolst12.netion.NetworkUtils.getClientGatewayIp(context)
+        }
+    }
+
     var showScannerDialog by remember { mutableStateOf(false) }
     var showIpHelpDialog by remember { mutableStateOf(false) }
+    var selectedProtocol by remember { mutableStateOf(ProxyProtocol.fromPort(proxyPort.toIntOrNull() ?: 8080)) }
+
+    LaunchedEffect(proxyPort) {
+        // Preserve an explicitly chosen/scanned protocol for custom ports. Standard
+        // port edits still select their conventional protocol for manual entry.
+        when (proxyPort.toIntOrNull()) {
+            8080 -> selectedProtocol = ProxyProtocol.HTTP
+            1080 -> selectedProtocol = ProxyProtocol.SOCKS5
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -99,7 +122,7 @@ fun ClientScreen(
                     singleLine    = true,
                     modifier      = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    enabled       = !isConnected,
+                    enabled       = !isConnected && !isStarting,
                     leadingIcon   = {
                         Icon(
                             Icons.Default.NetworkCheck,
@@ -107,7 +130,7 @@ fun ClientScreen(
                             tint = MaterialTheme.colorScheme.primary
                         )
                     },
-                    trailingIcon  = if (!isConnected) {
+                    trailingIcon  = if (!isConnected && !isStarting) {
                         {
                             IconButton(onClick = { showScannerDialog = true }) {
                                 Icon(
@@ -120,23 +143,22 @@ fun ClientScreen(
                     } else null
                 )
 
-                val context = androidx.compose.ui.platform.LocalContext.current
-                val gatewayIp = remember { io.github.arttolst12.netion.NetworkUtils.getClientGatewayIp(context) }
-                LaunchedEffect(gatewayIp) {
-                    if (gatewayIp != null && (proxyIp.isBlank() || proxyIp == io.github.arttolst12.netion.NetworkUtils.DEFAULT_HOTSPOT_IP)) {
-                        onProxyIpChange(gatewayIp)
+                val detectedGateway = gatewayIp
+                LaunchedEffect(detectedGateway) {
+                    if (detectedGateway != null && (proxyIp.isBlank() || proxyIp == io.github.arttolst12.netion.NetworkUtils.DEFAULT_HOTSPOT_IP)) {
+                        onProxyIpChange(detectedGateway)
                     }
                 }
-                val quickIps = remember(gatewayIp) {
+                val quickIps = remember(detectedGateway) {
                     val list = mutableListOf<String>()
-                    if (gatewayIp != null) list.add(gatewayIp)
+                    if (detectedGateway != null) list.add(detectedGateway)
                     if (!list.contains(io.github.arttolst12.netion.NetworkUtils.DEFAULT_HOTSPOT_IP)) {
                         list.add(io.github.arttolst12.netion.NetworkUtils.DEFAULT_HOTSPOT_IP)
                     }
                     list
                 }
 
-                if (!isConnected && quickIps.isNotEmpty()) {
+                if (!isConnected && !isStarting && quickIps.isNotEmpty()) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -146,7 +168,7 @@ fun ClientScreen(
                     ) {
                         for (quickIp in quickIps) {
                             val isSelected = proxyIp == quickIp
-                            val labelText = if (quickIp == gatewayIp) {
+                            val labelText = if (quickIp == detectedGateway) {
                                 "$quickIp (${s.ipChipAutoDetected})"
                             } else {
                                 "$quickIp (${s.ipChipFallbackHotspot})"
@@ -176,43 +198,51 @@ fun ClientScreen(
                     }
                 }
 
-                // Быстрый выбор протокола / порта
+                // Protocol selection is independent from the port: QR configurations
+                // may use custom ports for either HTTP or SOCKS5.
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    val isHttpSelected = proxyPort == "8080"
-                    val isSocksSelected = proxyPort == "1080"
-
                     FilterChip(
-                        selected = isHttpSelected,
-                        onClick = { if (!isConnected) onProxyPortChange("8080") },
+                        selected = selectedProtocol == ProxyProtocol.HTTP,
+                        onClick = {
+                            if (!isConnected && !isStarting) {
+                                selectedProtocol = ProxyProtocol.HTTP
+                                if (proxyPort == "1080") onProxyPortChange("8080")
+                            }
+                        },
                         label = {
                             Text(
-                                text = "HTTP (8080)",
+                                text = "HTTP",
                                 maxLines = 1,
                                 softWrap = false,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.fillMaxWidth()
                             )
                         },
-                        enabled = !isConnected,
+                        enabled = !isConnected && !isStarting,
                         modifier = Modifier.weight(1f)
                     )
 
                     FilterChip(
-                        selected = isSocksSelected,
-                        onClick = { if (!isConnected) onProxyPortChange("1080") },
+                        selected = selectedProtocol == ProxyProtocol.SOCKS5,
+                        onClick = {
+                            if (!isConnected && !isStarting) {
+                                selectedProtocol = ProxyProtocol.SOCKS5
+                                if (proxyPort == "8080") onProxyPortChange("1080")
+                            }
+                        },
                         label = {
                             Text(
-                                text = "SOCKS5 (1080)",
+                                text = "SOCKS5",
                                 maxLines = 1,
                                 softWrap = false,
                                 textAlign = TextAlign.Center,
                                 modifier = Modifier.fillMaxWidth()
                             )
                         },
-                        enabled = !isConnected,
+                        enabled = !isConnected && !isStarting,
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -225,7 +255,7 @@ fun ClientScreen(
                     singleLine    = true,
                     modifier      = Modifier.fillMaxWidth(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    enabled       = !isConnected,
+                    enabled       = !isConnected && !isStarting,
                     supportingText = {
                         Text(
                             s.portHint,
@@ -240,7 +270,6 @@ fun ClientScreen(
 
         // ─── Статус подключения ────────────────────────────────────
         if (isConnected) {
-            val protocolName = if (proxyPort == "1080") "SOCKS5" else "HTTP"
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -264,7 +293,7 @@ fun ClientScreen(
                         fontSize = 14.sp
                     )
                     Text(
-                        text  = "${s.trafficRoutedVia} $proxyIp:$proxyPort ($protocolName)",
+                        text  = "${s.trafficRoutedVia} $proxyIp:$proxyPort (${selectedProtocol.name})",
                         color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f),
                         fontSize = 12.sp
                     )
@@ -304,7 +333,8 @@ fun ClientScreen(
 
         // ─── Кнопка подключения ────────────────────────────────────
         Button(
-            onClick = onToggleVpn,
+            onClick = { onToggleVpn(selectedProtocol) },
+            enabled = !isStarting,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(56.dp),
@@ -330,14 +360,15 @@ fun ClientScreen(
 
     if (showScannerDialog) {
         QrScannerDialog(
-            onScanned = { ip, port ->
+            onScanned = { payload ->
                 showScannerDialog = false
-                onProxyIpChange(ip)
-                onProxyPortChange(port.toString())
+                onProxyIpChange(payload.ip)
+                onProxyPortChange(payload.port.toString())
+                selectedProtocol = payload.protocol
                 if (onConnectWith != null) {
-                    onConnectWith(ip, port)
+                    onConnectWith(payload)
                 } else {
-                    onToggleVpn()
+                    onToggleVpn(payload.protocol)
                 }
             },
             onDismiss = { showScannerDialog = false }

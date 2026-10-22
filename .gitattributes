@@ -1,0 +1,22 @@
+* text=auto
+*.kt text eol=lf
+*.kts text eol=lf
+*.toml text eol=lf
+*.properties text eol=lf
+*.xml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+/gradlew text eol=lf
+/gradlew.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.jar binary
+*.zip binary
+
+# Keep local working data out of future git archives as well.
+/.stability export-ignore
+/.stability-backups export-ignore
+/.publication export-ignore
+/STABILITY_AUDIT.md export-ignore
+/STABILITY_TODO.md export-ignore

@@ -5,16 +5,14 @@ plugins {
 
 android {
     namespace = "io.github.arttolst12.netion"
-    compileSdk {
-        version = release(37)
-    }
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "io.github.arttolst12.netion"
         minSdk = 24
         targetSdk = 37
-        versionCode = 16
-        versionName = "2.3.16"
+        versionCode = 17
+        versionName = "3.1.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -33,6 +31,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     testOptions {
         unitTests.isReturnDefaultValues = true

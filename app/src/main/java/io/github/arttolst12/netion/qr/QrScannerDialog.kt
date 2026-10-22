@@ -1,12 +1,7 @@
 ﻿package io.github.arttolst12.netion.qr
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
-import android.os.Build
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import android.util.Log
 import android.view.ViewGroup
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -61,7 +56,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
 fun QrScannerDialog(
-    onScanned: (ip: String, port: Int) -> Unit,
+    onScanned: (QrPayload) -> Unit,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -101,8 +96,7 @@ fun QrScannerDialog(
             if (hasCameraPermission) {
                 CameraScannerContent(
                     onScanned = { payload ->
-                        vibrateBriefly(context)
-                        onScanned(payload.ip, payload.port)
+                        onScanned(payload)
                         onDismiss()
                     },
                     onDismiss = onDismiss
@@ -457,20 +451,4 @@ private class QrCodeAnalyzer(
             else -> clean
         }
     }
-}
-
-private fun vibrateBriefly(context: Context) {
-    try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
-            vibratorManager?.defaultVibrator?.vibrate(
-                VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE)
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-            @Suppress("DEPRECATION")
-            vibrator?.vibrate(100)
-        }
-    } catch (_: Exception) {}
 }

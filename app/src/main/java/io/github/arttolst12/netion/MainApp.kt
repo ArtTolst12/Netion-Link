@@ -32,11 +32,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import io.github.arttolst12.netion.proxy.ProxyService
+import io.github.arttolst12.netion.qr.ProxyProtocol
+import io.github.arttolst12.netion.qr.QrPayload
 import io.github.arttolst12.netion.ui.*
 import io.github.arttolst12.netion.ui.theme.NetionTheme
 import io.github.arttolst12.netion.vpn.TunVpnService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class BannerType { ERROR, WARNING, SUCCESS }
 
@@ -71,15 +75,15 @@ fun MainApp() {
                 ?: AppLanguage.fromSystemLocale().code
         )
     }
-    val initialIp = remember {
+    val initialIp = remember { prefs.getString("proxy_ip", "192.168.43.1") ?: "192.168.43.1" }
+    var proxyIp by remember { mutableStateOf(initialIp) }
+    LaunchedEffect(context) {
         val saved = prefs.getString("proxy_ip", null)
-        if (!saved.isNullOrEmpty() && saved != "192.168.43.1") {
-            saved
-        } else {
-            NetworkUtils.getClientGatewayIp(context) ?: saved ?: "192.168.43.1"
+        if (saved.isNullOrEmpty() || saved == "192.168.43.1") {
+            val gateway = withContext(Dispatchers.IO) { NetworkUtils.getClientGatewayIp(context) }
+            if (!gateway.isNullOrBlank()) proxyIp = gateway
         }
     }
-    var proxyIp   by remember { mutableStateOf(initialIp) }
     var proxyPort by remember { mutableStateOf(prefs.getString("proxy_port", "8080") ?: "8080") }
 
     val currentLanguage = when (langCode) {
@@ -146,6 +150,14 @@ fun MainApp() {
     }
 }
 
+data class VpnStartConfig(
+    val host: String,
+    val port: Int,
+    val protocol: ProxyProtocol,
+)
+
+private fun ProxyProtocol.serviceType(): String = name
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MainScaffold(
@@ -158,11 +170,15 @@ private fun MainScaffold(
     onMenuClick: () -> Unit
 ) {
     val s = LocalStrings.current
+    val scope = rememberCoroutineScope()
 
     var selectedTab   by remember { mutableIntStateOf(0) }
     var serverIp      by remember { mutableStateOf<String?>(null) }
     var serverRunning by remember { mutableStateOf(ProxyService.isRunning) }
+    var serverStartPending by remember { mutableStateOf(false) }
     var vpnConnected  by remember { mutableStateOf(TunVpnService.isRunning) }
+    var vpnStartPending by remember { mutableStateOf(false) }
+    var pendingVpnConfig by remember { mutableStateOf<VpnStartConfig?>(null) }
 
     // Список активных баннеров
     val banners = remember { mutableStateListOf<BannerMessage>() }
@@ -189,30 +205,38 @@ private fun MainScaffold(
     val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as? PowerManager }
 
     LaunchedEffect(Unit) {
-        serverIp = NetworkUtils.getServerIp(context)
+        serverIp = withContext(Dispatchers.IO) { NetworkUtils.getServerIp(context) }
     }
 
     LaunchedEffect(Unit) {
         while (true) {
             vpnConnected = TunVpnService.isRunning
             serverRunning = ProxyService.isRunning
+            if (vpnConnected) vpnStartPending = false
+            if (serverRunning) serverStartPending = false
             activeHttpPortState = io.github.arttolst12.netion.proxy.ProxyService.activeHttpPort
             activeSocksPortState = io.github.arttolst12.netion.proxy.ProxyService.activeSocksPort
             if (!serverRunning) {
-                val latestIp = NetworkUtils.getServerIp(context)
+                val latestIp = withContext(Dispatchers.IO) { NetworkUtils.getServerIp(context) }
                 if (latestIp != serverIp) {
                     serverIp = latestIp
                 }
             }
             TunVpnService.lastError?.let { err ->
+                vpnStartPending = false
                 addBanner(err, BannerType.ERROR)
                 TunVpnService.lastError = null
+            }
+            ProxyService.lastError?.let { err ->
+                serverStartPending = false
+                addBanner(err, BannerType.ERROR)
+                ProxyService.lastError = null
             }
             ProxyService.portReallocationNotice?.let { notice ->
                 addBanner("${s.portReallocatedBanner}: $notice", BannerType.WARNING)
                 ProxyService.portReallocationNotice = null
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true) {
+            if (powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true) {
                 banners.removeAll { it.text == s.batteryOptBanner }
             }
             delay(1000)
@@ -222,7 +246,7 @@ private fun MainScaffold(
     // ─── Запрос отключения энергосбережения / оптимизации батареи ─
     val batteryBannerDismissed = remember { prefs.getBoolean("dismiss_battery_opt", false) }
     LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !batteryBannerDismissed) {
+        if (!batteryBannerDismissed) {
             val isIgnored = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
             if (!isIgnored) {
                 addBanner(
@@ -262,18 +286,28 @@ private fun MainScaffold(
                 type = BannerType.WARNING,
                 actionLabel = s.openSettings,
                 onAction = {
-                    try {
-                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                    val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
                             putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
-                        context.startActivity(intent)
-                    } catch (_: Exception) {
-                        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    } else {
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                             data = Uri.fromParts("package", context.packageName, null)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
-                        context.startActivity(intent)
+                    }
+                    try {
+                        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    } catch (_: Exception) {
+                        try {
+                            context.startActivity(
+                                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                    data = Uri.fromParts("package", context.packageName, null)
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                            )
+                        } catch (_: Exception) {
+                            // No settings Activity is available on this device.
+                        }
                     }
                 }
             )
@@ -295,16 +329,28 @@ private fun MainScaffold(
     val vpnPermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            val portNum = proxyPort.toIntOrNull() ?: 8080
-            val pType = if (portNum == 1080) "SOCKS5" else "HTTP"
-            startVpnService(context, proxyIp, portNum, pType)
-            vpnConnected = true
+        val config = pendingVpnConfig
+        pendingVpnConfig = null
+        if (result.resultCode == Activity.RESULT_OK && config != null) {
+            vpnStartPending = true
+            startVpnService(context, config.host, config.port, config.protocol.serviceType())
         } else {
+            vpnStartPending = false
             addBanner(
                 text = s.vpnRejectedError,
                 type = BannerType.ERROR
             )
+        }
+    }
+
+    fun requestVpnStart(config: VpnStartConfig) {
+        pendingVpnConfig = config
+        val vpnIntent = VpnService.prepare(context)
+        if (vpnIntent == null) {
+            vpnStartPending = true
+            startVpnService(context, config.host, config.port, config.protocol.serviceType())
+        } else {
+            vpnPermLauncher.launch(vpnIntent)
         }
     }
 
@@ -328,7 +374,7 @@ private fun MainScaffold(
                             color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
                         ) {
                             Text(
-                                text       = "V2.3.16",
+                                text       = "V${BuildConfig.VERSION_NAME}",
                                 fontSize   = 12.sp,
                                 fontWeight = FontWeight.Bold,
                                 color      = MaterialTheme.colorScheme.primary,
@@ -399,8 +445,10 @@ private fun MainScaffold(
                     socks5Port = if (serverRunning) activeSocksPortState else serverSocksPort,
                     isRunning  = serverRunning,
                     onRefreshIp = {
-                        serverIp = NetworkUtils.getServerIp(context)
-                        banners.removeAll { it.text == s.networkNotFoundBanner || it.text == s.tetheringUnavailableBanner }
+                        scope.launch {
+                            serverIp = withContext(Dispatchers.IO) { NetworkUtils.getServerIp(context) }
+                            banners.removeAll { it.text == s.networkNotFoundBanner || it.text == s.tetheringUnavailableBanner }
+                        }
                     },
                     onPortsChange = { newHttp, newSocks ->
                         serverHttpPort = newHttp
@@ -421,11 +469,22 @@ private fun MainScaffold(
                                 return@ServerScreen
                             }
                             if (serverIp == null) {
-                                serverIp = NetworkUtils.getServerIp(context)
-                            }
-                            if (serverIp != null) {
+                                if (!serverStartPending) {
+                                    serverStartPending = true
+                                    scope.launch {
+                                        val resolvedIp = withContext(Dispatchers.IO) { NetworkUtils.getServerIp(context) }
+                                        serverIp = resolvedIp
+                                        if (resolvedIp != null && !vpnConnected) {
+                                            startProxyService(context, serverHttpPort, serverSocksPort)
+                                            banners.removeAll { it.type == BannerType.ERROR && it.text == s.tetheringUnavailableBanner }
+                                        } else {
+                                            serverStartPending = false
+                                        }
+                                    }
+                                }
+                            } else {
+                                serverStartPending = true
                                 startProxyService(context, serverHttpPort, serverSocksPort)
-                                serverRunning = true
                                 banners.removeAll { it.type == BannerType.ERROR && it.text == s.tetheringUnavailableBanner }
                             }
                         }
@@ -439,24 +498,19 @@ private fun MainScaffold(
                     isServerRunning = serverRunning,
                     onProxyIpChange   = onIpChange,
                     onProxyPortChange = onPortChange,
-                    onConnectWith = { scannedIp, scannedPort ->
-                        onIpChange(scannedIp)
-                        onPortChange(scannedPort.toString())
+                    onConnectWith = { scanned ->
+                        onIpChange(scanned.ip)
+                        onPortChange(scanned.port.toString())
                         if (serverRunning) {
                             addBanner(s.stopServerBeforeVpnError, BannerType.WARNING)
                         } else {
                             addBanner(s.qrScanSuccess, BannerType.SUCCESS)
-                            val vpnIntent = VpnService.prepare(context)
-                            val pType = if (scannedPort == 1080) "SOCKS5" else "HTTP"
-                            if (vpnIntent == null) {
-                                startVpnService(context, scannedIp, scannedPort, pType)
-                                vpnConnected = true
-                            } else {
-                                vpnPermLauncher.launch(vpnIntent)
-                            }
+                            requestVpnStart(
+                                VpnStartConfig(scanned.ip, scanned.port, scanned.protocol)
+                            )
                         }
                     },
-                    onToggleVpn = {
+                    onToggleVpn = { protocol ->
                         if (vpnConnected) {
                             stopVpnService(context)
                             vpnConnected = false
@@ -478,18 +532,12 @@ private fun MainScaffold(
                                 hasInputError = true
                             }
 
-                            if (!hasInputError) {
-                                val vpnIntent = VpnService.prepare(context)
-                                val pType = if (port == 1080) "SOCKS5" else "HTTP"
-                                if (vpnIntent == null) {
-                                    startVpnService(context, ip, port!!, pType)
-                                    vpnConnected = true
-                                } else {
-                                    vpnPermLauncher.launch(vpnIntent)
-                                }
+                            if (!hasInputError && port != null) {
+                                requestVpnStart(VpnStartConfig(ip, port, protocol))
                             }
                         }
-                    }
+                    },
+                    isStarting = vpnStartPending
                 )
             }
         }

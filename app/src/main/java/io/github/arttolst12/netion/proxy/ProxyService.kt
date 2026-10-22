@@ -14,22 +14,25 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import io.github.arttolst12.netion.MainActivity
+import io.github.arttolst12.netion.NotificationText
 
 class ProxyService : Service() {
 
     companion object {
         private const val TAG = "ProxyService"
-        const val CHANNEL_ID        = "proxy_channel"
-        const val NOTIF_ID          = 1
-        const val EXTRA_PORT        = "extra_port"
-        const val EXTRA_HTTP_PORT   = "extra_http_port"
-        const val EXTRA_SOCKS_PORT  = "extra_socks_port"
-        const val ACTION_STOP       = "io.github.arttolst12.netion.STOP_PROXY"
+        const val CHANNEL_ID = "proxy_channel"
+        const val NOTIF_ID = 1
+        const val EXTRA_PORT = "extra_port"
+        const val EXTRA_HTTP_PORT = "extra_http_port"
+        const val EXTRA_SOCKS_PORT = "extra_socks_port"
+        const val ACTION_STOP = "io.github.arttolst12.netion.STOP_PROXY"
 
         @Volatile var activeHttpPort: Int = 8080
         @Volatile var activeSocksPort: Int = 1080
-        /** Set if requested ports were occupied and new ones were auto-allocated */
+        /** Set if requested ports were occupied and new ones were auto-allocated. */
         @Volatile var portReallocationNotice: String? = null
+        /** The most recent startup failure, retained for UI presentation after service cleanup. */
+        @Volatile var lastError: String? = null
 
         val serverBytesTx = java.util.concurrent.atomic.AtomicLong(0L)
         val serverBytesRx = java.util.concurrent.atomic.AtomicLong(0L)
@@ -65,41 +68,93 @@ class ProxyService : Service() {
 
         val httpPort = intent?.getIntExtra(EXTRA_HTTP_PORT, intent.getIntExtra(EXTRA_PORT, 8080)) ?: 8080
         val socksPort = intent?.getIntExtra(EXTRA_SOCKS_PORT, 1080) ?: 1080
-
-        if (proxyServer == null) {
-            portReallocationNotice = null
-            serverBytesTx.set(0L)
-            serverBytesRx.set(0L)
-            activeHttpPort = httpPort
-            activeSocksPort = socksPort
-
-            acquireLocks()
-
-            val server = ProxyServer(requestedHttpPort = httpPort, requestedSocks5Port = socksPort)
-            server.clientFilter = { addr -> io.github.arttolst12.netion.NetworkUtils.isClientAllowed(addr) }
-            server.onPortReallocated = { newHttp, newSocks ->
-                activeHttpPort = newHttp
-                activeSocksPort = newSocks
-                val noticeParts = mutableListOf<String>()
-                if (server.httpPortReallocated) {
-                    noticeParts.add("HTTP $httpPort → $newHttp")
-                }
-                if (server.socksPortReallocated) {
-                    noticeParts.add("SOCKS5 $socksPort → $newSocks")
-                }
-                portReallocationNotice = noticeParts.joinToString(", ")
-                updateNotification(newHttp, newSocks)
-            }
-            proxyServer = server
-            server.start()
-            activeHttpPort = server.httpPort
-            activeSocksPort = server.socks5Port
+        val existing = proxyServer
+        if (existing?.isRunning == true) {
+            // A repeated start command keeps the existing, successfully bound endpoints.
             isRunning = true
-            Log.i(TAG, "ProxyServer started on HTTP port ${server.httpPort} and SOCKS5 port ${server.socks5Port}")
-            io.github.arttolst12.netion.AppLogger.s("Server", "Proxy service started. HTTP=$activeHttpPort, SOCKS5=$activeSocksPort")
+            startAsForeground(buildNotification(existing.httpPort, existing.socks5Port))
+            return START_STICKY
+        }
+        if (existing != null) {
+            existing.stop()
+            proxyServer = null
+            isRunning = false
         }
 
-        val notification = buildNotification(activeHttpPort, activeSocksPort)
+        // Android requires foreground promotion before potentially lengthy startup work. This
+        // intentionally reports only a starting state, never unbound requested ports as active.
+        try {
+            startAsForeground(buildStartingNotification())
+        } catch (e: Exception) {
+            handleStartupFailure(null, e, startId)
+            return START_NOT_STICKY
+        }
+
+        lastError = null
+        portReallocationNotice = null
+        val startedNanos = System.nanoTime()
+        io.github.arttolst12.netion.AppLogger.i("Server", "Proxy service starting; requested_HTTP=$httpPort; requested_SOCKS5=$socksPort")
+        val server = ProxyServer(requestedHttpPort = httpPort, requestedSocks5Port = socksPort)
+        try {
+            acquireLocks()
+            server.clientFilter = { address ->
+                io.github.arttolst12.netion.NetworkUtils.isClientAllowed(address)
+            }
+
+            // start() synchronously binds both listeners or throws after rolling back both.
+            server.start()
+            if (!server.isRunning) {
+                throw IllegalStateException("Proxy startup was cancelled before both listeners became active")
+            }
+
+            // Publish all externally visible status only after both actual bind ports succeeded.
+            proxyServer = server
+            activeHttpPort = server.httpPort
+            activeSocksPort = server.socks5Port
+            serverBytesTx.set(0L)
+            serverBytesRx.set(0L)
+            if (server.httpPortReallocated || server.socksPortReallocated) {
+                val noticeParts = mutableListOf<String>()
+                if (server.httpPortReallocated) {
+                    noticeParts.add("HTTP $httpPort → ${server.httpPort}")
+                }
+                if (server.socksPortReallocated) {
+                    noticeParts.add("SOCKS5 $socksPort → ${server.socks5Port}")
+                }
+                portReallocationNotice = noticeParts.joinToString(", ")
+            }
+            isRunning = true
+            lastError = null
+            updateNotification(activeHttpPort, activeSocksPort)
+            Log.i(TAG, "ProxyServer started on HTTP port $activeHttpPort and SOCKS5 port $activeSocksPort")
+            io.github.arttolst12.netion.AppLogger.s(
+                "Server",
+                "Proxy service ready; HTTP=$activeHttpPort; SOCKS5=$activeSocksPort; ports_reallocated=${portReallocationNotice != null}; elapsed_ms=${io.github.arttolst12.netion.DiagnosticText.elapsedMillis(startedNanos)}"
+            )
+            return START_STICKY
+        } catch (e: Exception) {
+            handleStartupFailure(server, e, startId)
+            return START_NOT_STICKY
+        }
+    }
+
+    private fun handleStartupFailure(server: ProxyServer?, error: Exception, startId: Int) {
+        try {
+            server?.stop()
+        } catch (_: Exception) {
+        }
+        if (proxyServer === server) proxyServer = null
+        isRunning = false
+        portReallocationNotice = null
+        lastError = error.message ?: error.javaClass.simpleName
+        releaseLocks()
+        removeForegroundNotification()
+        Log.e(TAG, "Failed to start proxy server: $lastError", error)
+        io.github.arttolst12.netion.AppLogger.e("Server", "Proxy service startup failed", error)
+        stopSelfResult(startId)
+    }
+
+    private fun startAsForeground(notification: Notification) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIF_ID,
@@ -109,7 +164,10 @@ class ProxyService : Service() {
         } else {
             startForeground(NOTIF_ID, notification)
         }
-        return START_STICKY
+    }
+
+    private fun removeForegroundNotification() {
+        stopForeground(Service.STOP_FOREGROUND_REMOVE)
     }
 
     private fun acquireLocks() {
@@ -138,22 +196,25 @@ class ProxyService : Service() {
     private fun releaseLocks() {
         try {
             wakeLock?.let { if (it.isHeld) it.release() }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         wakeLock = null
 
         try {
             wifiLock?.let { if (it.isHeld) it.release() }
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         wifiLock = null
     }
 
     override fun onDestroy() {
         isRunning = false
         proxyServer?.let {
+            io.github.arttolst12.netion.AppLogger.i("Server", "Proxy stopping; active_clients=${it.activeClientConnectionsCount}; active_sockets=${it.activeSocketsCount}; rx_bytes=${it.totalBytesRx.get()}; tx_bytes=${it.totalBytesTx.get()}")
             serverBytesTx.set(it.totalBytesTx.get())
             serverBytesRx.set(it.totalBytesRx.get())
+            it.stop()
         }
-        proxyServer?.stop()
         proxyServer = null
         currentInstance = null
         portReallocationNotice = null
@@ -172,28 +233,38 @@ class ProxyService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val text = NotificationText.forContext(this)
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Netion Link Proxy Server",
+                text.proxyChannelName,
                 NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "Netion Link прокси-сервер активен" }
+            ).apply { description = text.proxyTitle }
             getSystemService(NotificationManager::class.java)
                 ?.createNotificationChannel(channel)
         }
     }
 
-    private fun buildNotification(httpPort: Int, socksPort: Int): Notification {
+    private fun buildStartingNotification(): Notification =
+        buildNotification(contentText = NotificationText.forContext(this).proxyTitle)
+
+    private fun buildNotification(httpPort: Int, socksPort: Int): Notification =
+        buildNotification(contentText = NotificationText.forContext(this).proxyBody(httpPort, socksPort))
+
+    private fun buildNotification(contentText: String): Notification {
         val mainIntent = PendingIntent.getActivity(
-            this, 0,
+            this,
+            0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
         val stopIntent = PendingIntent.getService(
-            this, 1,
+            this,
+            1,
             Intent(this, ProxyService::class.java).apply { action = ACTION_STOP },
             PendingIntent.FLAG_IMMUTABLE
         )
 
+        val text = NotificationText.forContext(this)
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, CHANNEL_ID)
         } else {
@@ -202,14 +273,14 @@ class ProxyService : Service() {
         }
 
         return builder
-            .setContentTitle("Netion Link — Раздача (Сервер)")
-            .setContentText("HTTP: $httpPort | SOCKS5: $socksPort")
+            .setContentTitle(text.proxyTitle)
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_menu_share)
             .setContentIntent(mainIntent)
             .addAction(
                 Notification.Action.Builder(
                     null,
-                    "Остановить",
+                    text.stopAction,
                     stopIntent
                 ).build()
             )

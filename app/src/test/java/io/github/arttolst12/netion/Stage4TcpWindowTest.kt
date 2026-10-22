@@ -61,7 +61,7 @@ class Stage4TcpWindowTest {
             srcPort = 50001,
             dstPort = 80,
             seqNum = 1001L,
-            ackNum = 0L,
+            ackNum = session.nextSendSequence,
             dataOffset = 20,
             flags = PacketUtils.TCP_ACK,
             windowSize = 65535
@@ -122,7 +122,7 @@ class Stage4TcpWindowTest {
             srcPort = 50002,
             dstPort = 80,
             seqNum = 2001L,
-            ackNum = 0L,
+            ackNum = session.nextSendSequence,
             dataOffset = 20,
             flags = PacketUtils.TCP_ACK,
             windowSize = 65535
@@ -173,7 +173,7 @@ class Stage4TcpWindowTest {
             srcPort = 50003,
             dstPort = 80,
             seqNum = seqBefore,
-            ackNum = 0L,
+            ackNum = session.nextSendSequence,
             dataOffset = 20,
             flags = PacketUtils.TCP_ACK,
             windowSize = 65535
@@ -233,7 +233,7 @@ class Stage4TcpWindowTest {
                 srcPort = 50004,
                 dstPort = 80,
                 seqNum = session.theirSeq,
-                ackNum = 0L,
+                ackNum = session.nextSendSequence,
                 dataOffset = 20,
                 flags = PacketUtils.TCP_ACK,
                 windowSize = 65535
@@ -246,7 +246,7 @@ class Stage4TcpWindowTest {
             session.handleData(dummyTcp.copy(seqNum = session.theirSeq), payload2)
 
             // Client sends FIN (half-close)
-            session.handleFin(dummyTcp.copy(seqNum = session.theirSeq, flags = PacketUtils.TCP_FIN))
+            session.handleFin(dummyTcp.copy(seqNum = session.theirSeq, flags = PacketUtils.TCP_FIN or PacketUtils.TCP_ACK))
             assertEquals("State must be HALF_CLOSED_LOCAL", TcpSession.State.HALF_CLOSED_LOCAL, session.state)
             assertFalse("Session must not be dead during half-close", session.isDead)
 
@@ -274,7 +274,9 @@ class Stage4TcpWindowTest {
             acceptedSocket.close()
             Thread.sleep(150)
 
-            assertTrue("Session must be cleanly closed after upstream EOF", session.isDead)
+            assertFalse("Proxy EOF must retain unacknowledged DATA/FIN", session.isDead)
+            session.handleAck(dummyTcp.copy(seqNum = session.theirSeq, ackNum = session.nextSendSequence))
+            assertTrue("Both half-closes complete only after the client acknowledges DATA/FIN", session.isDead)
             assertEquals(TcpSession.State.CLOSED, session.state)
 
         } finally {
@@ -304,7 +306,7 @@ class Stage4TcpWindowTest {
             srcPort = 50005,
             dstPort = 80,
             seqNum = 5001L,
-            ackNum = 0L,
+            ackNum = session.nextSendSequence,
             dataOffset = 20,
             flags = PacketUtils.TCP_ACK,
             windowSize = 65535
@@ -372,7 +374,7 @@ class Stage4TcpWindowTest {
                 srcPort = 50006,
                 dstPort = 80,
                 seqNum = session.theirSeq,
-                ackNum = 0L,
+                ackNum = session.nextSendSequence,
                 dataOffset = 20,
                 flags = PacketUtils.TCP_FIN or PacketUtils.TCP_ACK,
                 windowSize = 65535
@@ -468,7 +470,7 @@ class Stage4TcpWindowTest {
             // 2. Queue test payload via handleData
             val dummyTcp = PacketUtils.TcpHeader(
                 srcPort = 50007, dstPort = 80, seqNum = session.theirSeq,
-                ackNum = 0L, dataOffset = 20, flags = PacketUtils.TCP_ACK, windowSize = 65535
+                ackNum = session.nextSendSequence, dataOffset = 20, flags = PacketUtils.TCP_ACK, windowSize = 65535
             )
             val testData = "OP_WRITE_RESUME_VERIFIED_PAYLOAD_12345\n".toByteArray()
             session.handleData(dummyTcp.copy(seqNum = session.theirSeq), testData)
@@ -615,7 +617,7 @@ class Stage4TcpWindowTest {
             // Feed 32 KB of data
             val dummyTcp = PacketUtils.TcpHeader(
                 srcPort = 50000 + iteration, dstPort = 80, seqNum = session.theirSeq,
-                ackNum = 0L, dataOffset = 20, flags = PacketUtils.TCP_ACK, windowSize = 65535
+                ackNum = session.nextSendSequence, dataOffset = 20, flags = PacketUtils.TCP_ACK, windowSize = 65535
             )
             val chunk = ByteArray(8192)
             for (i in 1..4) {
@@ -834,7 +836,7 @@ class Stage4TcpWindowTest {
             srcPort = 55555,
             dstPort = 80,
             seqNum = initialTheirSeq,
-            ackNum = 0L,
+            ackNum = session.nextSendSequence,
             dataOffset = 20,
             flags = PacketUtils.TCP_ACK,
             windowSize = 65535
@@ -872,8 +874,9 @@ class Stage4TcpWindowTest {
     @Test
     fun testMultiSessionWindowAllocationNeverOvercommitsGlobalBudget() {
         val tracker = AtomicLong(0L)
+        val budget = 8192L
 
-        // Create 4 sessions sharing the tracker
+        // Four sessions contend for a deliberately small, actually reachable budget.
         val sessions = (1..4).map { i ->
             TcpSession(
                 srcIp = byteArrayOf(10, 0, 0, 2),
@@ -884,7 +887,8 @@ class Stage4TcpWindowTest {
                 proxyPort = 8080,
                 vpnService = null,
                 tunWriter = null,
-                globalMemoryTracker = tracker
+                globalMemoryTracker = tracker,
+                uploadBudgetBytes = budget
             ).also { it.markEstablishedForTesting(10000L + i * 1000) }
         }
 
@@ -895,17 +899,14 @@ class Stage4TcpWindowTest {
                 for (s in sessions) {
                     val dummyTcp = PacketUtils.TcpHeader(
                         srcPort = 45001, dstPort = 80, seqNum = s.theirSeq,
-                        ackNum = 0L, dataOffset = 20, flags = PacketUtils.TCP_ACK, windowSize = 65535
+                        ackNum = s.nextSendSequence, dataOffset = 20, flags = PacketUtils.TCP_ACK, windowSize = 65535
                     )
                     s.handleData(dummyTcp, chunk)
                 }
             }
 
-            // Tracker must never exceed MAX_GLOBAL_UPLOAD_BYTES
-            assertTrue(
-                "Global tracker must never exceed MAX_GLOBAL_UPLOAD_BYTES",
-                tracker.get() <= TcpSession.MAX_GLOBAL_UPLOAD_BYTES
-            )
+            assertEquals("The shared budget must actually be exhausted", budget, tracker.get())
+            assertEquals("Only two 4096-byte reservations fit", 2, sessions.count { it.uploadQueueBytes == 4096 })
 
             // When global memory is exhausted, rightEdge cannot be extended further
             for (s in sessions) {

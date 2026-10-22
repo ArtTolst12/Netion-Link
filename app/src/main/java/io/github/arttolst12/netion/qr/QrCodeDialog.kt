@@ -30,16 +30,20 @@ fun QrCodeDialog(
     onDismiss: () -> Unit
 ) {
     val s = LocalStrings.current
-    var selectedPort by remember { mutableIntStateOf(socks5Port) }
+    var selectedProtocol by remember(httpPort, socks5Port) { mutableStateOf(ProxyProtocol.SOCKS5) }
+    val selectedPort = if (selectedProtocol == ProxyProtocol.SOCKS5) socks5Port else httpPort
 
-    val qrBitmap: Bitmap? = remember(ip, selectedPort, httpPort, socks5Port) {
-        val uri = QrCodeManager.buildConnectionUri(
-            ip = ip,
-            selectedPort = selectedPort,
-            httpPort = httpPort,
-            socks5Port = socks5Port
-        )
-        QrCodeManager.generateQrBitmap(uri, sizePx = 600)
+    val qrBitmap: Bitmap? = remember(ip, selectedProtocol, selectedPort, httpPort, socks5Port) {
+        val uri = runCatching {
+            QrCodeManager.buildConnectionUri(
+                ip = ip,
+                selectedPort = selectedPort,
+                httpPort = httpPort,
+                socks5Port = socks5Port,
+                protocol = selectedProtocol,
+            )
+        }.getOrNull()
+        uri?.let { QrCodeManager.generateQrBitmap(it, sizePx = 600) }
     }
 
     Dialog(
@@ -107,8 +111,8 @@ fun QrCodeDialog(
                 ) {
                     FilterChip(
                         modifier = Modifier.weight(1f),
-                        selected = selectedPort == socks5Port,
-                        onClick = { selectedPort = socks5Port },
+                        selected = selectedProtocol == ProxyProtocol.SOCKS5,
+                        onClick = { selectedProtocol = ProxyProtocol.SOCKS5 },
                         label = {
                             Text(
                                 text = "SOCKS5 ($socks5Port)",
@@ -122,8 +126,8 @@ fun QrCodeDialog(
                     )
                     FilterChip(
                         modifier = Modifier.weight(1f),
-                        selected = selectedPort == httpPort,
-                        onClick = { selectedPort = httpPort },
+                        selected = selectedProtocol == ProxyProtocol.HTTP,
+                        onClick = { selectedProtocol = ProxyProtocol.HTTP },
                         label = {
                             Text(
                                 text = "HTTP ($httpPort)",

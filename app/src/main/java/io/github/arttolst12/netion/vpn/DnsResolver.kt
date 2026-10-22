@@ -4,13 +4,15 @@ import android.net.VpnService
 import android.util.Log
 import io.github.arttolst12.netion.AppLogger
 import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.io.InputStream
+import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -103,7 +105,32 @@ class DnsResolver(
     // LRU DNS Cache
     internal val cache = DnsLruCache(MAX_CACHE_ENTRIES)
 
+    /**
+     * [stateLock] makes socket registration atomic with shutdown. A socket is registered before
+     * protect/connect/send, so close() can reliably cancel every blocking resolver operation.
+     * [publicationLock] serializes the close boundary with cache/TUN publication: once close()
+     * returns, no worker can add a cache entry or send a late answer for this resolver generation.
+     */
+    private val stateLock = Any()
+    private val publicationLock = Any()
+    private val activeSockets = ConcurrentHashMap.newKeySet<Closeable>()
+
     @Volatile private var closed = false
+
+    private fun registerSocket(socket: Closeable): Boolean = synchronized(stateLock) {
+        if (closed) {
+            false
+        } else {
+            activeSockets.add(socket)
+            true
+        }
+    }
+
+    private fun unregisterSocket(socket: Closeable) {
+        activeSockets.remove(socket)
+    }
+
+    private fun isClosed(): Boolean = closed
 
     /**
      * Handle a DNS query packet from the TUN interface.
@@ -130,7 +157,9 @@ class DnsResolver(
         if (!parsedQuery.isEdnsOrDnssec) {
             val q = parsedQuery.questions[0]
             val key = DnsCacheKey(q.name, q.type, q.classCode)
-            val cachedReply = cache.get(key, parsedQuery.id)
+            val cachedReply = synchronized(publicationLock) {
+                if (closed) null else cache.get(key, parsedQuery.id)
+            }
             if (cachedReply != null) {
                 sendUdpPacket(dstIp, srcIp, dstPort, srcPort, cachedReply)
                 return
@@ -150,7 +179,6 @@ class DnsResolver(
                     val status = resolveViaProxyTcp(srcIp, dstIp, srcPort, dstPort, queryPayload, parsedQuery)
                     if (status == ResolutionStatus.SUCCESS) {
                         resolved = true
-                        AppLogger.s("DNS", "DNS resolved via TCP proxy $proxyIp:$proxyPort")
                     } else if (status == ResolutionStatus.PROTECT_FAILED) {
                         protectError = true
                     }
@@ -225,20 +253,28 @@ class DnsResolver(
         queryPayload: ByteArray,
         parsedQuery: ParsedDnsPacket?
     ): ResolutionStatus {
+        if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
         if (udpTransportFn != null) {
             if (protectSocketFn != null && !protectSocketFn.invoke(dnsIp)) {
                 sendServFail(clientIp, dnsIp, clientPort, dnsPort, queryPayload)
                 return ResolutionStatus.PROTECT_FAILED
             }
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
             val responseBytes = udpTransportFn.invoke(dnsIp, dnsPort, queryPayload)
                 ?: return ResolutionStatus.NETWORK_FAILURE
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
             val ok = validateAndProcessResponse(clientIp, dnsIp, clientPort, dnsPort, queryPayload, parsedQuery, responseBytes)
             return if (ok) ResolutionStatus.SUCCESS else ResolutionStatus.NETWORK_FAILURE
         }
 
         val socket = DatagramSocket()
+        if (!registerSocket(socket)) {
+            try { socket.close() } catch (_: Exception) {}
+            return ResolutionStatus.NETWORK_FAILURE
+        }
         try {
-            // Protect socket to exclude from TUN routing loop
+            // Registration precedes protect/send so resolver close can unblock any point below.
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
             val protected = protectSocket(socket)
             if (!protected) {
                 Log.w(TAG, "vpnService.protect() failed for DNS socket")
@@ -246,15 +282,18 @@ class DnsResolver(
                 sendServFail(clientIp, dnsIp, clientPort, dnsPort, queryPayload)
                 return ResolutionStatus.PROTECT_FAILED
             }
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
 
             socket.soTimeout = DNS_TIMEOUT_MS
             val dnsServer = InetAddress.getByAddress(dnsIp)
             val request = DatagramPacket(queryPayload, queryPayload.size, dnsServer, dnsPort)
             socket.send(request)
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
 
             val responseBuf = ByteArray(MAX_IPV4_UDP_PAYLOAD)
             val recvPacket = DatagramPacket(responseBuf, responseBuf.size)
             socket.receive(recvPacket)
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
 
             // Validate source address and port strictly
             if (recvPacket.address != dnsServer || recvPacket.port != dnsPort) {
@@ -266,10 +305,11 @@ class DnsResolver(
             if (!validateAndProcessResponse(clientIp, dnsIp, clientPort, dnsPort, queryPayload, parsedQuery, respBytes)) {
                 return ResolutionStatus.NETWORK_FAILURE
             }
-            return ResolutionStatus.SUCCESS
+            return if (isClosed()) ResolutionStatus.NETWORK_FAILURE else ResolutionStatus.SUCCESS
         } catch (_: Exception) {
             return ResolutionStatus.NETWORK_FAILURE
         } finally {
+            unregisterSocket(socket)
             try { socket.close() } catch (_: Exception) {}
         }
     }
@@ -282,109 +322,92 @@ class DnsResolver(
         queryPayload: ByteArray,
         parsedQuery: ParsedDnsPacket?
     ): ResolutionStatus {
-        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(DNS_TIMEOUT_MS.toLong())
+        if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
+        val startedNanos = System.nanoTime()
+        val deadlineNs = startedNanos + TimeUnit.MILLISECONDS.toNanos(DNS_TIMEOUT_MS.toLong())
+        var phase = "protect-and-bind"
         val socket = Socket()
-
-        // P1: Validate protect() result strictly for TCP proxy socket
-        val protected = protectSocket(socket)
-        if (!protected) {
-            try { socket.close() } catch (_: Exception) {}
-            Log.w(TAG, "vpnService.protect() failed for DNS TCP socket")
-            AppLogger.w("DNS", "Socket protect() failed; aborting DNS proxy connection to prevent VPN routing loop")
-            sendServFail(clientIp, dnsIp, clientPort, dnsPort, queryPayload)
-            return ResolutionStatus.PROTECT_FAILED
-        }
-
-        val connectTimeout = remainingTimeoutMs(deadlineNs)
-        if (connectTimeout <= 0) {
+        if (!registerSocket(socket)) {
             try { socket.close() } catch (_: Exception) {}
             return ResolutionStatus.NETWORK_FAILURE
         }
-        socket.soTimeout = connectTimeout
-        socket.tcpNoDelay = true
-
-        val underlyingNetwork = vpnService?.let { io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(it, proxyIp) }
-        if (underlyingNetwork != null) {
-            try { underlyingNetwork.bindSocket(socket) } catch (_: Exception) {}
-        }
 
         try {
-            socket.connect(InetSocketAddress(proxyIp, proxyPort), connectTimeout)
+            // The socket has been registered before protect/bind/connect so close() can cancel it.
+            if (!VpnSocketSetup.prepare(socket, protect = ::protectSocket, bindToNetwork = { protectedSocket ->
+                    vpnService?.let { service ->
+                        val network = io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(service, proxyIp)
+                            ?: throw IOException("No underlying network for DNS proxy")
+                        try {
+                            network.bindSocket(protectedSocket)
+                        } catch (e: Exception) {
+                            throw IOException("Failed to bind DNS proxy socket to underlying network", e)
+                        }
+                    }
+                })) {
+                if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
+                Log.w(TAG, "vpnService.protect() failed for DNS TCP socket")
+                AppLogger.w("DNS", "Socket protect() failed; proxy=$proxyIp:$proxyPort; bound=${socket.isBound}; connected=${socket.isConnected}; tx_id=${parsedQuery?.id}; direct_fallback=blocked. Check VPN permission and active service.")
+                sendServFail(clientIp, dnsIp, clientPort, dnsPort, queryPayload)
+                return ResolutionStatus.PROTECT_FAILED
+            }
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
+
+            phase = "proxy-handshake"
+            val targetPort = if (dnsPort > 0) dnsPort else 53
+            val connectTimeout = remainingTimeoutMs(deadlineNs)
+            if (connectTimeout <= 0) return ResolutionStatus.NETWORK_FAILURE
+            // ProxyHandshake owns CONNECT/SOCKS framing. The deadline started above so every
+            // remaining DNS-over-TCP read shares the same DNS_TIMEOUT_MS budget.
+            ProxyHandshake.connect(
+                socket = socket,
+                proxyIp = proxyIp ?: return ResolutionStatus.NETWORK_FAILURE,
+                proxyPort = proxyPort,
+                targetIp = dnsIp,
+                targetPort = targetPort,
+                socks5 = isSocks,
+                timeoutMs = connectTimeout,
+                onPhase = { phase = it }
+            )
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
+
+            phase = "dns-write"
             val output = socket.getOutputStream()
             val input = socket.getInputStream()
-
-            val dnsHost = PacketUtils.ipToString(dnsIp)
-            val targetPort = if (dnsPort > 0) dnsPort else 53
-
-            if (isSocks) {
-                // SOCKS5 Handshake
-                output.write(byteArrayOf(0x05, 0x01, 0x00))
-                output.flush()
-
-                val gVer = readByteWithDeadline(input, socket, deadlineNs)
-                val gMethod = readByteWithDeadline(input, socket, deadlineNs)
-                if (gVer != 5 || gMethod != 0) return ResolutionStatus.NETWORK_FAILURE
-
-                // SOCKS5 CONNECT
-                val req = ByteArray(10)
-                req[0] = 0x05
-                req[1] = 0x01 // CONNECT
-                req[2] = 0x00
-                req[3] = 0x01 // IPv4
-                System.arraycopy(dnsIp, 0, req, 4, 4)
-                req[8] = (targetPort shr 8).toByte()
-                req[9] = (targetPort and 0xFF).toByte()
-                output.write(req)
-                output.flush()
-
-                val rVer = readByteWithDeadline(input, socket, deadlineNs)
-                val rRep = readByteWithDeadline(input, socket, deadlineNs)
-                readByteWithDeadline(input, socket, deadlineNs) // RSV
-                val rAtyp = readByteWithDeadline(input, socket, deadlineNs)
-                if (rVer != 5 || rRep != 0) return ResolutionStatus.NETWORK_FAILURE
-
-                when (rAtyp) {
-                    1 -> readFully(input, ByteArray(6), socket, deadlineNs)
-                    3 -> {
-                        val len = readByteWithDeadline(input, socket, deadlineNs)
-                        if (len > 0) readFully(input, ByteArray(len + 2), socket, deadlineNs)
-                    }
-                    4 -> readFully(input, ByteArray(18), socket, deadlineNs)
-                    else -> return ResolutionStatus.NETWORK_FAILURE
-                }
-            } else {
-                // HTTP CONNECT Handshake
-                val req = "CONNECT $dnsHost:$targetPort HTTP/1.1\r\nHost: $dnsHost:$targetPort\r\n\r\n"
-                output.write(req.toByteArray(Charsets.US_ASCII))
-                output.flush()
-
-                val resp = readHttpResponseLine(input, socket, deadlineNs)
-                if (!resp.startsWith("HTTP/1.1 200") && !resp.startsWith("HTTP/1.0 200")) {
-                    return ResolutionStatus.NETWORK_FAILURE
-                }
-            }
-
-            // DNS-over-TCP: 2-byte length prefix (RFC 1035)
             val qLen = queryPayload.size
             output.write((qLen shr 8).toByte().toInt())
             output.write((qLen and 0xFF).toByte().toInt())
             output.write(queryPayload)
             output.flush()
 
+            phase = "dns-read-length"
             val respLenHi = readByteWithDeadline(input, socket, deadlineNs)
             val respLenLo = readByteWithDeadline(input, socket, deadlineNs)
             if (respLenHi == -1 || respLenLo == -1) return ResolutionStatus.NETWORK_FAILURE
             val respLen = (respLenHi shl 8) or respLenLo
             if (respLen <= 0 || respLen > MAX_TCP_DNS_RESPONSE_SIZE) return ResolutionStatus.NETWORK_FAILURE
 
+            phase = "dns-read-body"
             val dnsResponse = ByteArray(respLen)
             readFully(input, dnsResponse, socket, deadlineNs)
+            if (isClosed()) return ResolutionStatus.NETWORK_FAILURE
 
+            phase = "response-validation"
             val ok = validateAndProcessResponse(clientIp, dnsIp, clientPort, dnsPort, queryPayload, parsedQuery, dnsResponse)
-            return if (ok) ResolutionStatus.SUCCESS else ResolutionStatus.NETWORK_FAILURE
-        } catch (_: Exception) {
+            if (!isClosed()) {
+                val details = "tx_id=${parsedQuery?.id}; type=${parsedQuery?.questions?.firstOrNull()?.type}; proxy=$proxyIp:$proxyPort; protocol=${if (isSocks) "SOCKS5" else "HTTP_CONNECT"}; response_bytes=$respLen; elapsed_ms=${io.github.arttolst12.netion.DiagnosticText.elapsedMillis(startedNanos)}"
+                if (ok) AppLogger.s("DNS", "DNS response accepted; $details")
+                else AppLogger.w("DNS", "DNS response rejected; $details")
+            }
+            return if (ok && !isClosed()) ResolutionStatus.SUCCESS else ResolutionStatus.NETWORK_FAILURE
+        } catch (e: Exception) {
+            if (!isClosed()) {
+                Log.d(TAG, "DNS proxy connection failed: ${e.message}")
+                AppLogger.e("DNS", "DNS proxy operation failed; phase=$phase; tx_id=${parsedQuery?.id}; proxy=$proxyIp:$proxyPort; timeout_ms=$DNS_TIMEOUT_MS; elapsed_ms=${io.github.arttolst12.netion.DiagnosticText.elapsedMillis(startedNanos)}", e)
+            }
             return ResolutionStatus.NETWORK_FAILURE
         } finally {
+            unregisterSocket(socket)
             try { socket.close() } catch (_: Exception) {}
         }
     }
@@ -398,6 +421,7 @@ class DnsResolver(
         parsedQuery: ParsedDnsPacket?,
         responseBytes: ByteArray
     ): Boolean {
+        if (isClosed()) return false
         val q = parsedQuery ?: parseDnsPacket(queryPayload) ?: return false
         val r = parseDnsPacket(responseBytes) ?: return false
 
@@ -433,6 +457,8 @@ class DnsResolver(
             }
         }
 
+        if (isClosed()) return false
+
         // 5. Determine maximum allowed UDP payload size for client (RFC 1035 / RFC 6891 / TUN MTU)
         val maxAllowedUdp = if (q.isEdnsOrDnssec) {
             val opt = q.additionals.firstOrNull { it.type == TYPE_OPT }
@@ -446,8 +472,7 @@ class DnsResolver(
 
         // 6. Cache response if query is standard (single question, not EDNS/DO) and response was not truncated
         if (!q.isEdnsOrDnssec && q.questions.size == 1 && !r.isTruncated && !isOversized) {
-            val cacheKey = DnsCacheKey(q.questions[0].name, q.questions[0].type, q.questions[0].classCode)
-            maybeCacheResponse(cacheKey, r, responseBytes)
+            maybeCacheResponse(DnsCacheKey(q.questions[0].name, q.questions[0].type, q.questions[0].classCode), r, responseBytes)
         }
 
         // 7. If response exceeds client UDP capacity or TUN MTU, create well-formed truncated response with TC=1
@@ -457,9 +482,9 @@ class DnsResolver(
             responseBytes
         }
 
-        // 8. Send UDP packet to TUN client
-        sendUdpPacket(dnsIp, clientIp, dnsPort, clientPort, finalPayload)
-        return true
+        // 8. Send UDP packet to TUN client. sendUdpPacket has the final close check while holding
+        // publicationLock, so no response can cross a completed resolver close().
+        return sendUdpPacket(dnsIp, clientIp, dnsPort, clientPort, finalPayload)
     }
 
     private fun maybeCacheResponse(
@@ -499,7 +524,7 @@ class DnsResolver(
                 }
             }
 
-            cache.put(key, DnsCacheEntry(rawBytes, now, offsets, isNegative = true, negativeTtlSeconds = effectiveNegativeTtl))
+            putCacheIfOpen(key, DnsCacheEntry(rawBytes, now, offsets, isNegative = true, negativeTtlSeconds = effectiveNegativeTtl))
             return
         }
 
@@ -518,7 +543,15 @@ class DnsResolver(
                 }
             }
 
-            cache.put(key, DnsCacheEntry(rawBytes, now, offsets, isNegative = false, negativeTtlSeconds = 0L))
+            putCacheIfOpen(key, DnsCacheEntry(rawBytes, now, offsets, isNegative = false, negativeTtlSeconds = 0L))
+        }
+    }
+
+    private fun putCacheIfOpen(key: DnsCacheKey, entry: DnsCacheEntry) {
+        synchronized(publicationLock) {
+            if (!closed) {
+                cache.put(key, entry)
+            }
         }
     }
 
@@ -539,23 +572,30 @@ class DnsResolver(
         srcPort: Int,
         dstPort: Int,
         payload: ByteArray
-    ) {
-        try {
-            // Safety guard: drop any packet exceeding the TUN MTU budget (1372 bytes)
-            if (payload.size > MAX_TUN_UDP_PAYLOAD) {
-                Log.w(TAG, "Payload size ${payload.size} exceeds TUN MTU payload budget $MAX_TUN_UDP_PAYLOAD; dropping")
-                return
+    ): Boolean {
+        if (payload.size > MAX_TUN_UDP_PAYLOAD) {
+            Log.w(TAG, "Payload size ${payload.size} exceeds TUN MTU payload budget $MAX_TUN_UDP_PAYLOAD; dropping")
+            return false
+        }
+        synchronized(publicationLock) {
+            if (closed) return false
+            return try {
+                val pkt = PacketUtils.buildUdpPacket(
+                    srcIp = srcIp,
+                    dstIp = dstIp,
+                    srcPort = srcPort,
+                    dstPort = dstPort,
+                    payload = payload
+                )
+                // Recheck immediately before publishing. A generation close that wins this lock
+                // will suppress the write instead of allowing a late DNS answer onto a new TUN.
+                if (closed) return false
+                tunWriter?.write(pkt)
+                true
+            } catch (e: Exception) {
+                Log.d(TAG, "Failed writing UDP packet to TUN: ${e.message}")
+                false
             }
-            val pkt = PacketUtils.buildUdpPacket(
-                srcIp = srcIp,
-                dstIp = dstIp,
-                srcPort = srcPort,
-                dstPort = dstPort,
-                payload = payload
-            )
-            tunWriter?.write(pkt)
-        } catch (e: Exception) {
-            Log.d(TAG, "Failed writing UDP packet to TUN: ${e.message}")
         }
     }
 
@@ -672,35 +712,40 @@ class DnsResolver(
         }
     }
 
-    private fun readHttpResponseLine(input: InputStream, socket: Socket, deadlineNs: Long): String {
-        val sb = StringBuilder()
-        while (true) {
-            val remaining = remainingTimeoutMs(deadlineNs)
-            if (remaining <= 0) throw java.net.SocketTimeoutException("DNS proxy operation deadline exceeded")
-            socket.soTimeout = remaining
-            val b = input.read()
-            if (b == -1) break
-            sb.append(b.toChar())
-            if (sb.length >= 4 && sb.substring(sb.length - 4) == "\r\n\r\n") break
-            if (sb.length > 2048) break
-        }
-        return sb.toString().lines().firstOrNull() ?: ""
-    }
-
     private fun protectSocket(socket: Socket): Boolean {
-        if (protectSocketFn != null) return protectSocketFn.invoke(socket)
-        return vpnService?.protect(socket) ?: (vpnService == null)
+        if (isClosed()) return false
+        return if (protectSocketFn != null) protectSocketFn.invoke(socket)
+        else vpnService?.protect(socket) ?: (vpnService == null)
     }
 
     private fun protectSocket(socket: DatagramSocket): Boolean {
-        if (protectSocketFn != null) return protectSocketFn.invoke(socket)
-        return vpnService?.protect(socket) ?: (vpnService == null)
+        if (isClosed()) return false
+        return if (protectSocketFn != null) protectSocketFn.invoke(socket)
+        else vpnService?.protect(socket) ?: (vpnService == null)
     }
 
+    /**
+     * Begins shutdown before returning. Resolver workers recheck [closed] before cache/TUN
+     * publication; socket registration is atomic with this transition, so every blocking network
+     * operation is closed here without joining a worker.
+     */
     fun close() {
-        closed = true
+        val sockets: List<Closeable>
+        synchronized(publicationLock) {
+            synchronized(stateLock) {
+                if (closed) return
+                // Invalidate first. Workers recheck this before every cache/TUN publication.
+                closed = true
+                sockets = activeSockets.toList()
+                activeSockets.clear()
+            }
+            cache.clear()
+        }
+        // Close blocking I/O before executor shutdown. Never wait for workers here.
+        sockets.forEach { socket ->
+            try { socket.close() } catch (_: Exception) {}
+        }
         executor.shutdownNow()
-        cache.clear()
     }
 
     // ─────────────────────────────────────────────────
@@ -901,38 +946,43 @@ class DnsResolver(
     }
 
     internal fun readDomainName(data: ByteArray, startOffset: Int): Pair<String, Int>? {
+        if (startOffset !in data.indices) return null
         val labels = mutableListOf<String>()
         var offset = startOffset
         var jumps = 0
         var bytesConsumed = 0
+        var expandedLength = 1 // The terminating root label counts toward the 255-byte limit.
         var jumped = false
 
         while (offset < data.size && jumps < 32) {
             val len = data[offset].toInt() and 0xFF
             if (len == 0) {
                 if (!jumped) bytesConsumed = (offset + 1) - startOffset
-                break
+                return Pair(labels.joinToString("."), bytesConsumed)
             } else if ((len and 0xC0) == 0xC0) {
-                // Compression pointer
                 if (offset + 1 >= data.size) return null
+                val ptr = ((len and 0x3F) shl 8) or (data[offset + 1].toInt() and 0xFF)
+                // RFC 1035 compression points to a prior occurrence, never forward or to itself.
+                if (ptr >= offset) return null
                 if (!jumped) {
                     bytesConsumed = (offset + 2) - startOffset
                     jumped = true
                 }
-                val ptr = ((len and 0x3F) shl 8) or (data[offset + 1].toInt() and 0xFF)
-                if (ptr >= data.size) return null
                 offset = ptr
                 jumps++
             } else {
+                // The 01 and 10 label prefixes are reserved, not lengths of 64..191 bytes.
+                if (len and 0xC0 != 0) return null
                 offset++
                 if (offset + len > data.size) return null
+                expandedLength += len + 1
+                if (expandedLength > 255) return null
                 labels.add(String(data, offset, len, Charsets.US_ASCII).lowercase())
                 offset += len
                 if (!jumped) bytesConsumed = offset - startOffset
             }
         }
-        if (jumps >= 32) return null // Loop detected
-        return Pair(labels.joinToString("."), bytesConsumed)
+        return null // Missing root terminator or an excessive/cyclic compression chain.
     }
 
     internal fun parseSoaMinimumTtl(data: ByteArray, soaRecord: DnsRecord): Long? {

@@ -107,13 +107,11 @@ class SocksBridge(
         var upstream: Socket? = null
         try {
             upstream = Socket().apply { tcpNoDelay = true }
-            vpnService.protect(upstream)
-            val underlyingNetwork = io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(vpnService, upstreamIp)
-            if (underlyingNetwork != null) {
-                try {
-                    underlyingNetwork.bindSocket(upstream)
-                } catch (_: Exception) {}
-            }
+            if (!VpnSocketSetup.prepare(upstream, protect = { vpnService.protect(it) }, bindToNetwork = {
+                    val network = io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(vpnService, upstreamIp)
+                        ?: throw java.io.IOException("No underlying network for SOCKS bridge")
+                    network.bindSocket(it)
+                })) throw java.io.IOException("VPN socket protection failed")
             upstream.connect(InetSocketAddress(upstreamIp, upstreamPort), CONNECT_TIMEOUT_MS)
             upstream.soTimeout = 0
             client.soTimeout = 0
@@ -189,13 +187,11 @@ class SocksBridge(
         var upstream: Socket? = null
         try {
             upstream = Socket().apply { tcpNoDelay = true }
-            vpnService.protect(upstream)
-            val underlyingNetwork = io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(vpnService, upstreamIp)
-            if (underlyingNetwork != null) {
-                try {
-                    underlyingNetwork.bindSocket(upstream)
-                } catch (_: Exception) {}
-            }
+            if (!VpnSocketSetup.prepare(upstream, protect = { vpnService.protect(it) }, bindToNetwork = {
+                    val network = io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(vpnService, upstreamIp)
+                        ?: throw java.io.IOException("No underlying network for SOCKS bridge")
+                    network.bindSocket(it)
+                })) throw java.io.IOException("VPN socket protection failed")
             upstream.connect(InetSocketAddress(upstreamIp, upstreamPort), CONNECT_TIMEOUT_MS)
             upstream.soTimeout = 0
             client.soTimeout = 0

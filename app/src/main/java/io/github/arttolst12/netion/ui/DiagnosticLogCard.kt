@@ -38,7 +38,7 @@ fun DiagnosticLogCard(
     val listState = rememberLazyListState()
     val logs = AppLogger.logs
 
-    LaunchedEffect(logs.size) {
+    LaunchedEffect(logs.lastOrNull()?.id) {
         if (logs.isNotEmpty()) {
             listState.animateScrollToItem(logs.size - 1)
         }
@@ -93,12 +93,7 @@ fun DiagnosticLogCard(
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     IconButton(
                         onClick = {
-                            val text = AppLogger.getAllText()
-                            if (text.isNotBlank()) {
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                cm.setPrimaryClip(ClipData.newPlainText("Netion Link Log", text))
-                                Toast.makeText(context, s.logCopied, Toast.LENGTH_SHORT).show()
-                            }
+                            copyDiagnosticReport(context, s.logCopied)
                         },
                         modifier = Modifier.size(32.dp)
                     ) {
@@ -152,40 +147,7 @@ fun DiagnosticLogCard(
                         modifier = Modifier.fillMaxSize(),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        items(logs, key = { it.id }) { item ->
-                            val textColor = when {
-                                item.isError -> Color(0xFFFF5252)
-                                item.isSuccess -> Color(0xFF69F0AE)
-                                else -> Color(0xFFE0E0E0)
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.Top
-                            ) {
-                                Text(
-                                    text = item.time,
-                                    fontSize = 10.sp,
-                                    color = Color(0xFF888888),
-                                    fontFamily = FontFamily.Monospace
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = "[${item.tag}]",
-                                    fontSize = 10.sp,
-                                    color = Color(0xFF4FC3F7),
-                                    fontFamily = FontFamily.Monospace,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = item.message,
-                                    fontSize = 10.sp,
-                                    color = textColor,
-                                    fontFamily = FontFamily.Monospace,
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
-                        }
+                        items(logs, key = { it.id }) { item -> DiagnosticEntry(item) }
                     }
                 }
             }
@@ -206,7 +168,7 @@ fun DiagnosticLogDialog(
     val listState = rememberLazyListState()
     val logs = AppLogger.logs
 
-    LaunchedEffect(logs.size) {
+    LaunchedEffect(logs.lastOrNull()?.id) {
         if (logs.isNotEmpty()) {
             listState.animateScrollToItem(logs.size - 1)
         }
@@ -251,12 +213,7 @@ fun DiagnosticLogDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     IconButton(
                         onClick = {
-                            val text = AppLogger.getAllText()
-                            if (text.isNotBlank()) {
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                cm.setPrimaryClip(ClipData.newPlainText("Netion Link Log", text))
-                                Toast.makeText(context, s.logCopied, Toast.LENGTH_SHORT).show()
-                            }
+                            copyDiagnosticReport(context, s.logCopied)
                         },
                         modifier = Modifier.size(36.dp)
                     ) {
@@ -321,40 +278,7 @@ fun DiagnosticLogDialog(
                             modifier = Modifier.fillMaxSize(),
                             verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
-                            items(logs, key = { it.id }) { item ->
-                                val textColor = when {
-                                    item.isError -> Color(0xFFFF5252)
-                                    item.isSuccess -> Color(0xFF69F0AE)
-                                    else -> Color(0xFFE0E0E0)
-                                }
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.Top
-                                ) {
-                                    Text(
-                                        text = item.time,
-                                        fontSize = 10.sp,
-                                        color = Color(0xFF888888),
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(
-                                        text = "[${item.tag}]",
-                                        fontSize = 10.sp,
-                                        color = Color(0xFF4FC3F7),
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(
-                                        text = item.message,
-                                        fontSize = 10.sp,
-                                        color = textColor,
-                                        fontFamily = FontFamily.Monospace,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                            }
+                            items(logs, key = { it.id }) { item -> DiagnosticEntry(item) }
                         }
                     }
                 }
@@ -366,4 +290,42 @@ fun DiagnosticLogDialog(
             }
         }
     )
+}
+
+@Composable
+private fun DiagnosticEntry(item: AppLogger.LogItem) {
+    val textColor = when (item.level) {
+        AppLogger.Level.ERROR -> Color(0xFFFF5252)
+        AppLogger.Level.WARN -> Color(0xFFFFD180)
+        AppLogger.Level.SUCCESS -> Color(0xFF69F0AE)
+        AppLogger.Level.DEBUG -> Color(0xFFB0BEC5)
+        AppLogger.Level.INFO -> Color(0xFFE0E0E0)
+    }
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = "${item.time} [${item.level}] [${item.tag}] +${item.elapsedMs}ms [${item.thread}]",
+            fontSize = 10.sp,
+            lineHeight = 14.sp,
+            color = Color(0xFF90CAF9),
+            fontFamily = FontFamily.Monospace
+        )
+        Text(
+            text = item.message,
+            fontSize = 11.sp,
+            lineHeight = 15.sp,
+            color = textColor,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+private fun copyDiagnosticReport(context: Context, copiedMessage: String) {
+    try {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            ?: throw IllegalStateException("Clipboard service is unavailable")
+        clipboard.setPrimaryClip(ClipData.newPlainText("Netion Link Log", AppLogger.getDiagnosticReport()))
+        Toast.makeText(context, copiedMessage, Toast.LENGTH_SHORT).show()
+    } catch (error: Exception) {
+        AppLogger.e("Diagnostics", "Unable to copy diagnostic report to clipboard", error)
+    }
 }

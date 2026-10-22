@@ -22,3 +22,32 @@ local.properties
 build_output*.txt
 /.idea/
 /.kotlin/
+
+# Local verification data, caches, backups and publication archives
+/.stability/
+/.stability-backups/
+/.publication/
+/STABILITY_AUDIT.md
+/STABILITY_TODO.md
+**/build/
+/captures/
+*.log
+*.hprof
+
+# Local credentials and signing configuration
+.env
+.env.*
+!.env.example
+/secrets/
+/keystore.properties
+/signing.properties
+*.p12
+*.pfx
+*.pem
+*.crt
+*.cer
+
+# Editor and OS state
+.vscode/
+Thumbs.db
+Desktop.ini

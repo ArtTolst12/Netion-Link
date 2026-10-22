@@ -802,7 +802,9 @@ class Stage5DnsResolverTest {
             Thread {
                 try {
                     for (i in 0 until iterations) {
-                        val domain = "host-$t-$i.example.com"
+                        // Keep one key per thread: put/get are separate operations, so a
+                        // capacity-overflow workload can legitimately evict a key between them.
+                        val domain = "host-$t.example.com"
                         val key = DnsResolver.DnsCacheKey(domain, DnsResolver.TYPE_A, DnsResolver.CLASS_IN)
                         val resp = buildStandardResponse(i, domain, answerTtls = listOf(60L))
                         val parsed = resolver.parseDnsPacket(resp)!!
@@ -814,8 +816,8 @@ class Stage5DnsResolverTest {
                             0L
                         )
                         resolver.cache.put(key, entry)
-                        val hit = resolver.cache.get(key, i)
-                        if (hit == null) {
+                        val hit = resolver.cache.get(key, i, entry.cachedAtMs)
+                        if (hit == null || !hit.contentEquals(resp)) {
                             errors.incrementAndGet()
                         }
                     }
@@ -829,8 +831,44 @@ class Stage5DnsResolverTest {
 
         assertTrue("All concurrent worker threads must complete", latch.await(5, TimeUnit.SECONDS))
         assertEquals("No errors during concurrent cache access", 0, errors.get())
-        assertTrue("Cache size must be bounded by MAX_CACHE_ENTRIES", resolver.cache.size() <= DnsResolver.MAX_CACHE_ENTRIES)
+        assertEquals("All per-thread keys must survive without capacity eviction", numThreads, resolver.cache.size())
         resolver.close()
+    }
+
+    @Test
+    fun testCacheCapacityEvictsLeastRecentlyUsedEntry() {
+        val resolver = DnsResolver()
+        try {
+            val now = 1000L
+            val keys = (0..DnsResolver.MAX_CACHE_ENTRIES).map {
+                DnsResolver.DnsCacheKey("lru-$it.example.com", DnsResolver.TYPE_A, DnsResolver.CLASS_IN)
+            }
+            for (key in keys.take(DnsResolver.MAX_CACHE_ENTRIES)) {
+                val response = buildStandardResponse(1, key.name, answerTtls = listOf(60L))
+                val parsed = resolver.parseDnsPacket(response)!!
+                resolver.cache.put(key, DnsResolver.DnsCacheEntry(
+                    response, now,
+                    listOf(DnsResolver.RecordTtlOffset(parsed.answers[0].ttlOffset, 60L)),
+                    false, 0L
+                ))
+            }
+            // Reading the first inserted entry must move it to the most-recently-used end.
+            assertNotNull(resolver.cache.get(keys[0], 1, now))
+            val extra = keys.last()
+            val response = buildStandardResponse(2, extra.name, answerTtls = listOf(60L))
+            val parsed = resolver.parseDnsPacket(response)!!
+            resolver.cache.put(extra, DnsResolver.DnsCacheEntry(
+                response, now,
+                listOf(DnsResolver.RecordTtlOffset(parsed.answers[0].ttlOffset, 60L)),
+                false, 0L
+            ))
+            assertEquals(DnsResolver.MAX_CACHE_ENTRIES, resolver.cache.size())
+            assertNotNull("Recently read entry must survive", resolver.cache.get(keys[0], 1, now))
+            assertNull("Least recently used entry must be evicted", resolver.cache.get(keys[1], 1, now))
+            assertNotNull("New entry must be available", resolver.cache.get(extra, 2, now))
+        } finally {
+            resolver.close()
+        }
     }
 
     // ─────────────────────────────────────────────────────────────

@@ -5,7 +5,6 @@ import android.util.Log
 import io.github.arttolst12.netion.AppLogger
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.channels.SelectionKey
@@ -13,7 +12,6 @@ import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
 import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.SynchronousQueue
@@ -40,6 +38,9 @@ class TcpSession(
     private val tunWriter: TunWriter? = null,
     private val globalMemoryTracker: AtomicLong? = null,
     private val handshakeExecutor: ExecutorService? = null,
+    private val globalDownloadMemoryTracker: AtomicLong? = null,
+    private val uploadBudgetBytes: Long = MAX_GLOBAL_UPLOAD_BYTES,
+    private val nanoTime: () -> Long = System::nanoTime,
     var onEstablished: ((TcpSession, SocketChannel) -> Unit)? = null
 ) {
     companion object {
@@ -51,6 +52,10 @@ class TcpSession(
         const val HIGH_WATERMARK = 48 * 1024   // 48 KB: freeze rightEdge expansion
         const val LOW_WATERMARK = 16 * 1024    // 16 KB: resume window expansion / window update
         const val MAX_GLOBAL_UPLOAD_BYTES = 16L * 1024 * 1024 // 16 MB global cap across all sessions
+        const val MAX_GLOBAL_DOWNLOAD_BYTES = 16L * 1024 * 1024
+        private val workerFactory = java.util.concurrent.ThreadFactory { task ->
+            Thread(task, "tcp-worker").apply { isDaemon = true }
+        }
 
         // Bounded shared handshake pool (max 16 concurrent handshakes, AbortPolicy on overflow)
         val defaultHandshakeExecutor: ExecutorService = ThreadPoolExecutor(
@@ -58,6 +63,7 @@ class TcpSession(
             16,
             60L, TimeUnit.SECONDS,
             SynchronousQueue<Runnable>(),
+            workerFactory,
             ThreadPoolExecutor.AbortPolicy()
         )
 
@@ -68,7 +74,8 @@ class TcpSession(
             60L,
             TimeUnit.SECONDS,
             LinkedBlockingQueue(128),
-            ThreadPoolExecutor.DiscardPolicy()
+            workerFactory,
+            ThreadPoolExecutor.AbortPolicy()
         )
 
         fun isSeqBefore(a: Long, b: Long): Boolean {
@@ -88,10 +95,11 @@ class TcpSession(
 
     // Locks
     private val stateLock = Any()
-    private val writeLock = Any()
+    private val drainOwner = AtomicBoolean(false)
+    private val readOwner = AtomicBoolean(false)
 
     // Sequence numbers (unsigned-32 in Long)
-    private var initialOurSeq: Long = (System.nanoTime() and 0xFFFFFFFFL) // ISN
+    private var initialOurSeq: Long = (nanoTime() and 0xFFFFFFFFL) // ISN
     private var ourSeq: Long = initialOurSeq
     var theirSeq: Long = 0L; private set  // set from SYN (RCV.NXT)
     var rightEdge: Long = 0L; private set // Monotonic advertised window right edge (RCV.NXT + RCV.WND)
@@ -101,10 +109,35 @@ class TcpSession(
     var uploadQueueBytes = 0; private set
     private var clientFinReceived = false
     private var proxyOutputShutdown = false
+    private var proxyReadEof = false
+    private var ourFinSent = false
+    private var ourFinAcknowledged = false
+    private var ourFinSequence = 0L
+    private var sndUna = initialOurSeq
+    private var peerWindow = 65535
+    private var peerRightEdge = (initialOurSeq + 1 + peerWindow) and 0xFFFFFFFFL
+    private var windowUpdateSeq: Long? = null
+    private var windowUpdateAck = 0L
+    private var lastProbeNs = nanoTime()
+    private val pendingDownload = ArrayDeque<ByteBuffer>()
+    var downloadQueueBytes = 0; private set
+
+    private data class SentSegment(
+        var sequence: Long,
+        var payload: ByteArray,
+        val flags: Int,
+        var sentAtNs: Long,
+        var retries: Int = 0
+    ) {
+        val sequenceLength: Int get() = payload.size +
+            (if (flags and PacketUtils.TCP_SYN != 0) 1 else 0) +
+            (if (flags and PacketUtils.TCP_FIN != 0) 1 else 0)
+    }
+    private val unacknowledged = ArrayDeque<SentSegment>()
 
     // NIO Selector attachment
-    var selectionKey: SelectionKey? = null
-    var selector: Selector? = null
+    @Volatile var selectionKey: SelectionKey? = null
+    @Volatile var selector: Selector? = null
 
     // Fallback drain coalescing flag (prevents unbound task accumulation)
     private val isDraining = AtomicBoolean(false)
@@ -132,21 +165,36 @@ class TcpSession(
     }
 
     // Upstream proxy socket channel and streams
-    var proxyChannel: SocketChannel? = null; private set
-    private var proxySocket: Socket? = null
-    private var proxyOut: OutputStream? = null
-    private var proxyIn: InputStream? = null
+    @Volatile var proxyChannel: SocketChannel? = null; private set
+    @Volatile private var proxySocket: Socket? = null
+    @Volatile private var proxyOut: OutputStream? = null
+    @Volatile private var proxyIn: InputStream? = null
 
     // Track whether connectAndHandshake was already initiated to prevent duplicate threads on retransmitted SYNs
     private val isConnectStarted = AtomicBoolean(false)
 
     enum class State { CONNECTING, ESTABLISHED, HALF_CLOSED_LOCAL, CLOSED }
 
-    internal fun markEstablishedForTesting(initialSeq: Long = 1000L) {
+    internal fun markEstablishedForTesting(initialSeq: Long = 1000L, ourInitialSeq: Long? = null) {
         synchronized(stateLock) {
+            if (ourInitialSeq != null) initialOurSeq = ourInitialSeq and 0xFFFFFFFFL
+            ourSeq = (initialOurSeq + 1) and 0xFFFFFFFFL
+            sndUna = ourSeq
+            peerRightEdge = (ourSeq + peerWindow) and 0xFFFFFFFFL
             theirSeq = (initialSeq + 1) and 0xFFFFFFFFL
             rightEdge = (theirSeq + minOf(65535, HARD_BUFFER_CAP)) and 0xFFFFFFFFL
             state = State.ESTABLISHED
+        }
+    }
+
+    internal val nextSendSequence: Long get() = synchronized(stateLock) { ourSeq }
+    internal val acknowledgedSequence: Long get() = synchronized(stateLock) { sndUna }
+
+    fun setInitialPeerWindow(window: Int) {
+        synchronized(stateLock) {
+            if (state != State.CONNECTING) return
+            peerWindow = window.coerceIn(0, 65535)
+            peerRightEdge = (initialOurSeq + 1 + peerWindow) and 0xFFFFFFFFL
         }
     }
 
@@ -157,7 +205,7 @@ class TcpSession(
     fun computeAdvertisedWindowLocked(): Int {
         val sessionSpace = (HARD_BUFFER_CAP - uploadQueueBytes).coerceAtLeast(0)
         val globalUsed = globalMemoryTracker?.get() ?: 0L
-        val globalAvailable = (MAX_GLOBAL_UPLOAD_BYTES - globalUsed).coerceAtLeast(0L)
+        val globalAvailable = (uploadBudgetBytes - globalUsed).coerceAtLeast(0L)
         val availableSpace = minOf(sessionSpace.toLong(), globalAvailable).coerceIn(0L, 65535L).toInt()
 
         // Only advance rightEdge if pending bytes are below HIGH_WATERMARK and space is available
@@ -179,22 +227,39 @@ class TcpSession(
     }
 
     private fun releaseMemoryLocked(bytes: Int) {
-        if (bytes <= 0) return
-        globalMemoryTracker?.updateAndGet { current ->
-            if (current >= bytes) current - bytes else 0L
+        if (bytes > 0) globalMemoryTracker?.addAndGet(-bytes.toLong())
+    }
+
+    private fun reserveMemory(tracker: AtomicLong?, bytes: Int, cap: Long): Boolean {
+        if (tracker == null) return true
+        while (true) {
+            val used = tracker.get()
+            if (used < 0 || bytes.toLong() > cap - used) return false
+            if (tracker.compareAndSet(used, used + bytes)) return true
         }
     }
+
+    private fun sendCreditLocked(): Int {
+        val distance = (peerRightEdge - ourSeq) and 0xFFFFFFFFL
+        return if (distance > 0x7FFFFFFFL) 0 else minOf(distance, 65535L).toInt()
+    }
+
+    private fun downloadSpaceLocked(): Int = minOf(
+        (HARD_BUFFER_CAP - downloadQueueBytes).coerceAtLeast(0).toLong(),
+        (MAX_GLOBAL_DOWNLOAD_BYTES - (globalDownloadMemoryTracker?.get() ?: 0L)).coerceAtLeast(0L)
+    ).toInt()
 
     fun updateInterestOpsLocked() {
         val key = selectionKey ?: return
         if (!key.isValid) return
         try {
             val currentOps = key.interestOps()
-            val hasPendingWrites = uploadQueue.isNotEmpty() || (clientFinReceived && !proxyOutputShutdown)
-            val newOps = if (hasPendingWrites) {
-                SelectionKey.OP_READ or SelectionKey.OP_WRITE
-            } else {
-                SelectionKey.OP_READ
+            var newOps = 0
+            if (!proxyReadEof && sendCreditLocked() > 0 && downloadSpaceLocked() > 0) {
+                newOps = newOps or SelectionKey.OP_READ
+            }
+            if (uploadQueue.isNotEmpty() || (clientFinReceived && !proxyOutputShutdown)) {
+                newOps = newOps or SelectionKey.OP_WRITE
             }
             if (currentOps != newOps) {
                 key.interestOps(newOps)
@@ -229,11 +294,10 @@ class TcpSession(
                 return
             }
             if (state == State.CLOSED) return
-            theirSeq = (clientSeq + 1) and 0xFFFFFFFFL // expect next byte
-            rightEdge = (theirSeq + minOf(65535, HARD_BUFFER_CAP)) and 0xFFFFFFFFL
-
-            // Prevent duplicate connect attempts if another SYN arrives while still CONNECTING
             if (isConnectStarted.compareAndSet(false, true)) {
+                theirSeq = (clientSeq + 1) and 0xFFFFFFFFL
+                rightEdge = (theirSeq + minOf(65535, HARD_BUFFER_CAP)) and 0xFFFFFFFFL
+                windowUpdateSeq = clientSeq
                 shouldStartConnect = true
             }
         }
@@ -252,130 +316,115 @@ class TcpSession(
         }
     }
 
+    /** Accept only contiguous, previously unseen bytes. */
+    private fun acceptPayloadLocked(sequence: Long, payload: ByteArray): Boolean {
+        val difference = (sequence - theirSeq) and 0xFFFFFFFFL
+        if (difference in 1L..0x7FFFFFFFL) return false
+        val skip = if (difference == 0L) 0 else
+            minOf((theirSeq - sequence) and 0xFFFFFFFFL, payload.size.toLong()).toInt()
+        if (skip == payload.size) return true
+        if (clientFinReceived) return false
+        val size = payload.size - skip
+        val end = (theirSeq + size) and 0xFFFFFFFFL
+        if (uploadQueueBytes + size > HARD_BUFFER_CAP || !isSeqBeforeOrEqual(end, rightEdge)) return false
+        if (!reserveMemory(globalMemoryTracker, size, uploadBudgetBytes)) return false
+        try {
+            uploadQueue.addLast(ByteBuffer.wrap(payload.copyOfRange(skip, payload.size)))
+        } catch (failure: Throwable) {
+            releaseMemoryLocked(size)
+            throw failure
+        }
+        uploadQueueBytes += size
+        theirSeq = end
+        return true
+    }
+
     fun handleData(tcp: PacketUtils.TcpHeader, payload: ByteArray) {
-        if ((state != State.ESTABLISHED && state != State.HALF_CLOSED_LOCAL) || isDead) return
-        markActive()
-        if (payload.isEmpty()) return
-
-        var accepted = false
-        var currentWin: Int
-
         synchronized(stateLock) {
-            if ((state != State.ESTABLISHED && state != State.HALF_CLOSED_LOCAL) || isDead) return
-
-            val segSeq = tcp.seqNum
-            val diff = (segSeq - theirSeq) and 0xFFFFFFFFL
-
-            if (diff == 0L) {
-                // In-order segment matching theirSeq
-                val canAccept = (uploadQueueBytes + payload.size <= HARD_BUFFER_CAP) &&
-                        ((globalMemoryTracker?.get() ?: 0L) + payload.size <= MAX_GLOBAL_UPLOAD_BYTES) &&
-                        isSeqBeforeOrEqual((theirSeq + payload.size) and 0xFFFFFFFFL, rightEdge)
-
-                if (canAccept) {
-                    val buf = ByteBuffer.wrap(payload.copyOf())
-                    uploadQueue.addLast(buf)
-                    uploadQueueBytes += payload.size
-                    globalMemoryTracker?.addAndGet(payload.size.toLong())
-
-                    theirSeq = (theirSeq + payload.size) and 0xFFFFFFFFL
-                    currentWin = computeAdvertisedWindowLocked()
-                    sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = currentWin)
-                    updateInterestOpsLocked()
-                    accepted = true
-                } else {
-                    // Buffer cap exceeded or beyond rightEdge: do not accept, do not advance theirSeq
-                    currentWin = computeAdvertisedWindowLocked()
-                    sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = currentWin)
-                }
-            } else if (diff > 0x7FFFFFFFL) {
-                // Retransmission: segSeq < theirSeq
-                val alreadyReceived = ((theirSeq - segSeq) and 0xFFFFFFFFL).toInt()
-                if (alreadyReceived >= payload.size) {
-                    // Fully duplicate segment: re-ACK with current window
-                    currentWin = computeAdvertisedWindowLocked()
-                    sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = currentWin)
-                } else {
-                    // Partially new segment
-                    val newBytes = payload.copyOfRange(alreadyReceived, payload.size)
-                    val canAccept = (uploadQueueBytes + newBytes.size <= HARD_BUFFER_CAP) &&
-                            ((globalMemoryTracker?.get() ?: 0L) + newBytes.size <= MAX_GLOBAL_UPLOAD_BYTES) &&
-                            isSeqBeforeOrEqual((theirSeq + newBytes.size) and 0xFFFFFFFFL, rightEdge)
-
-                    if (canAccept) {
-                        val buf = ByteBuffer.wrap(newBytes)
-                        uploadQueue.addLast(buf)
-                        uploadQueueBytes += newBytes.size
-                        globalMemoryTracker?.addAndGet(newBytes.size.toLong())
-
-                        theirSeq = (theirSeq + newBytes.size) and 0xFFFFFFFFL
-                        currentWin = computeAdvertisedWindowLocked()
-                        sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = currentWin)
-                        updateInterestOpsLocked()
-                        accepted = true
-                    } else {
-                        currentWin = computeAdvertisedWindowLocked()
-                        sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = currentWin)
-                    }
-                }
-            } else {
-                // Out-of-order segment ahead of theirSeq: prompt retransmission with cumulative ACK
-                currentWin = computeAdvertisedWindowLocked()
-                sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = currentWin)
+            if (isDead || state == State.CONNECTING) return
+            if (!processAckLocked(tcp) || isDead) return
+            if (payload.isNotEmpty()) {
+                if (acceptPayloadLocked(tcp.seqNum, payload)) markActive()
+                sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0))
+                updateInterestOpsLocked()
             }
+            maybeFinishLocked()
         }
+        triggerUploadDrain()
+    }
 
-        if (accepted) {
-            triggerUploadDrain()
+    /** Cumulative ACK and window updates apply to ACK, DATA and FIN segments alike. */
+    private fun processAckLocked(tcp: PacketUtils.TcpHeader): Boolean {
+        if (tcp.flags and PacketUtils.TCP_ACK == 0 || state == State.CONNECTING || isDead) return false
+        val ack = tcp.ackNum
+        val acknowledgedBytes = (ack - sndUna) and 0xFFFFFFFFL
+        val outstandingBytes = (ourSeq - sndUna) and 0xFFFFFFFFL
+        if (acknowledgedBytes > outstandingBytes) {
+            // A stale ACK does not acknowledge anything new, but its in-order payload can
+            // still be valid. An ACK beyond SND.NXT must reject the entire DATA/FIN segment.
+            if (isSeqBefore(ack, sndUna)) return true
+            sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0))
+            return false
         }
+        val previousSeq = windowUpdateSeq
+        if (previousSeq == null || isSeqBefore(previousSeq, tcp.seqNum) ||
+            (previousSeq == tcp.seqNum && isSeqBeforeOrEqual(windowUpdateAck, ack))) {
+            peerWindow = tcp.windowSize.coerceIn(0, 65535)
+            peerRightEdge = (ack + peerWindow) and 0xFFFFFFFFL
+            windowUpdateSeq = tcp.seqNum
+            windowUpdateAck = ack
+        }
+        if (ack != sndUna) {
+            markActive()
+            while (unacknowledged.isNotEmpty()) {
+                val first = unacknowledged.peekFirst() ?: break
+                val count = (ack - first.sequence) and 0xFFFFFFFFL
+                if (count == 0L || count > 0x7FFFFFFFL) break
+                if (count >= first.sequenceLength) {
+                    unacknowledged.removeFirst()
+                    downloadQueueBytes -= first.payload.size
+                    if (first.payload.isNotEmpty()) globalDownloadMemoryTracker?.addAndGet(-first.payload.size.toLong())
+                } else {
+                    val bytes = minOf(count.toInt(), first.payload.size)
+                    first.payload = first.payload.copyOfRange(bytes, first.payload.size)
+                    first.sequence = ack
+                    downloadQueueBytes -= bytes
+                    if (bytes > 0) globalDownloadMemoryTracker?.addAndGet(-bytes.toLong())
+                    break
+                }
+            }
+            sndUna = ack
+            if (ourFinSent && isSeqBeforeOrEqual((ourFinSequence + 1) and 0xFFFFFFFFL, ack)) ourFinAcknowledged = true
+            unacknowledged.peekFirst()?.let { it.sentAtNs = nanoTime(); it.retries = 0 }
+        }
+        flushDownstreamLocked()
+        updateInterestOpsLocked()
+        return !isDead
     }
 
     fun handleAck(tcp: PacketUtils.TcpHeader) {
-        markActive()
+        synchronized(stateLock) {
+            processAckLocked(tcp)
+            maybeFinishLocked()
+        }
     }
 
     fun handleFin(tcp: PacketUtils.TcpHeader, payload: ByteArray = ByteArray(0)) {
         synchronized(stateLock) {
-            if (isDead) return
-            markActive()
-
-            val segSeq = tcp.seqNum
-            val diff = (segSeq - theirSeq) and 0xFFFFFFFFL
-
-            // If FIN arrived out of order (diff != 0L), prompt retransmission with cumulative ACK
-            if (diff != 0L) {
-                val win = computeAdvertisedWindowLocked()
-                sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = win)
-                return
+            if (isDead || state == State.CONNECTING) return
+            if (!processAckLocked(tcp) || isDead) return
+            val finSequence = (tcp.seqNum + payload.size) and 0xFFFFFFFFL
+            val hadFin = clientFinReceived
+            if (!hadFin && acceptPayloadLocked(tcp.seqNum, payload) && finSequence == theirSeq &&
+                computeAdvertisedWindowLocked() > 0) {
+                theirSeq = (theirSeq + 1) and 0xFFFFFFFFL
+                clientFinReceived = true
+                state = State.HALF_CLOSED_LOCAL
+                markActive()
             }
-
-            // 1. Process payload if present in FIN segment
-            if (payload.isNotEmpty()) {
-                val canAccept = (uploadQueueBytes + payload.size <= HARD_BUFFER_CAP) &&
-                        ((globalMemoryTracker?.get() ?: 0L) + payload.size <= MAX_GLOBAL_UPLOAD_BYTES) &&
-                        isSeqBeforeOrEqual((theirSeq + payload.size) and 0xFFFFFFFFL, rightEdge)
-
-                if (canAccept) {
-                    val buf = ByteBuffer.wrap(payload.copyOf())
-                    uploadQueue.addLast(buf)
-                    uploadQueueBytes += payload.size
-                    globalMemoryTracker?.addAndGet(payload.size.toLong())
-                    theirSeq = (theirSeq + payload.size) and 0xFFFFFFFFL
-                } else {
-                    // Buffer cap or global limit exceeded: cannot accept payload or FIN
-                    val win = computeAdvertisedWindowLocked()
-                    sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = win)
-                    return
-                }
-            }
-
-            // 2. Consume FIN control bit (advances sequence space by 1)
-            theirSeq = (theirSeq + 1) and 0xFFFFFFFFL
-            clientFinReceived = true
-            state = State.HALF_CLOSED_LOCAL
-            val win = computeAdvertisedWindowLocked()
-            sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = win)
+            sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0))
             updateInterestOpsLocked()
+            maybeFinishLocked()
         }
         triggerUploadDrain()
     }
@@ -389,6 +438,8 @@ class TcpSession(
     // ─────────────────────────────────────────────────────────
 
     private fun connectAndHandshake() {
+        val startedNanos = System.nanoTime()
+        var phase = "socket-open"
         val dstStr = PacketUtils.ipToString(dstIp)
         val channel: SocketChannel
         try {
@@ -411,87 +462,24 @@ class TcpSession(
         }
 
         try {
+            Log.i(TAG, "Connecting to proxy $proxyIp:$proxyPort for $dstStr:$dstPort...")
             AppLogger.i("Client", "Connecting to proxy $proxyIp:$proxyPort for $dstStr:$dstPort...")
-            vpnService?.protect(sock)
-            val underlyingNetwork = vpnService?.let { io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(it, proxyIp) }
-            if (underlyingNetwork != null) {
-                try {
-                    underlyingNetwork.bindSocket(sock)
-                    AppLogger.d("Client", "Socket bound to underlying network: $underlyingNetwork")
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to bind socket to network $underlyingNetwork: ${e.message}")
-                }
+
+            phase = "protect-and-bind"
+            if (vpnService != null) {
+                if (!VpnSocketSetup.prepare(sock, protect = { vpnService.protect(it) }, bindToNetwork = {
+                        val network = io.github.arttolst12.netion.NetworkUtils.getUnderlyingNetwork(vpnService, proxyIp)
+                            ?: throw java.io.IOException("No underlying network for proxy")
+                        network.bindSocket(it)
+                    })) throw java.io.IOException("VPN socket protection failed")
             }
-            sock.connect(InetSocketAddress(proxyIp, proxyPort), 10_000)
-            sock.soTimeout = 10_000
             sock.tcpNoDelay = true
             sock.keepAlive = true
-            val out = sock.getOutputStream()
-            val inp = sock.getInputStream()
-            proxyOut = out
-            proxyIn = inp
-            AppLogger.s("Client", "Connected to $proxyIp:$proxyPort! Handshaking for $dstStr:$dstPort...")
-
-            if (isSocks5) {
-                // SOCKS5 Handshake
-                // 1. Send greeting: VER 5, 1 auth method: 0 (No Auth)
-                out.write(byteArrayOf(0x05, 0x01, 0x00))
-                out.flush()
-
-                val ver = inp.read()
-                val method = inp.read()
-                if (ver != 5 || method != 0) {
-                    Log.w(TAG, "SOCKS5 greeting rejected: ver=$ver, method=$method")
-                    AppLogger.e("Client", "SOCKS5 proxy $proxyIp:$proxyPort rejected auth method (ver=$ver, method=$method)")
-                    sendRst()
-                    close()
-                    return
-                }
-
-                // 2. Send CONNECT request for dstIp:dstPort
-                val req = ByteArray(10)
-                req[0] = 0x05
-                req[1] = 0x01 // CONNECT
-                req[2] = 0x00 // RSV
-                req[3] = 0x01 // IPv4
-                System.arraycopy(dstIp, 0, req, 4, 4)
-                req[8] = (dstPort shr 8).toByte()
-                req[9] = (dstPort and 0xFF).toByte()
-                out.write(req)
-                out.flush()
-
-                // 3. Read response: VER, REP, RSV, ATYP...
-                val respVer = inp.read()
-                val respRep = inp.read()
-                inp.read() // RSV
-                val respAtyp = inp.read()
-                if (respVer != 5 || respRep != 0) {
-                    Log.w(TAG, "SOCKS5 connect rejected: rep=$respRep")
-                    AppLogger.e("Client", "SOCKS5 proxy rejected CONNECT to $dstStr:$dstPort (code=$respRep)")
-                    sendRst()
-                    close()
-                    return
-                }
-                when (respAtyp) {
-                    1 -> { val b = ByteArray(6); readFully(inp, b) }
-                    3 -> { val len = inp.read(); val b = ByteArray(len + 2); readFully(inp, b) }
-                    4 -> { val b = ByteArray(18); readFully(inp, b) }
-                }
-            } else {
-                // HTTP CONNECT Handshake
-                val req = "CONNECT $dstStr:$dstPort HTTP/1.1\r\nHost: $dstStr:$dstPort\r\n\r\n"
-                out.write(req.toByteArray())
-                out.flush()
-
-                val resp = readHttpResponse(inp)
-                if (!resp.startsWith("HTTP/1.1 200") && !resp.startsWith("HTTP/1.0 200")) {
-                    Log.w(TAG, "Proxy CONNECT rejected: $resp")
-                    AppLogger.e("Client", "HTTP proxy rejected CONNECT to $dstStr:$dstPort: $resp")
-                    sendRst()
-                    close()
-                    return
-                }
-            }
+            phase = "proxy-handshake"
+            ProxyHandshake.connect(sock, proxyIp, proxyPort, dstIp, dstPort, isSocks5, onPhase = { phase = it })
+            phase = "session-registration"
+            proxyOut = sock.getOutputStream()
+            proxyIn = sock.getInputStream()
 
             sock.soTimeout = 0
             synchronized(stateLock) {
@@ -499,17 +487,9 @@ class TcpSession(
                     try { channel.close() } catch (_: Exception) {}
                     return
                 }
-                // Send SYN-ACK to client
-                sendTcpPacketLocked(
-                    PacketUtils.TCP_SYN or PacketUtils.TCP_ACK,
-                    ByteArray(0),
-                    includeMss = true,
-                    overrideSeq = initialOurSeq,
-                    windowSize = computeAdvertisedWindowLocked()
-                )
-                ourSeq = (initialOurSeq + 1) and 0xFFFFFFFFL  // SYN consumes 1 seq
                 state = State.ESTABLISHED
-                AppLogger.s("Client", "Tunnel open to $dstStr:$dstPort via $proxyIp:$proxyPort")
+                if (!sendTrackedLocked(PacketUtils.TCP_SYN or PacketUtils.TCP_ACK, ByteArray(0))) return
+                AppLogger.s("Client", "Tunnel open; session=${key()}; proxy=$proxyIp:$proxyPort; protocol=${if (isSocks5) "SOCKS5" else "HTTP_CONNECT"}; elapsed_ms=${io.github.arttolst12.netion.DiagnosticText.elapsedMillis(startedNanos)}")
             }
 
             // Switch to non-blocking mode after handshake
@@ -527,7 +507,7 @@ class TcpSession(
         } catch (e: Exception) {
             if (!isDead) {
                 Log.e(TAG, "Proxy connect/handshake failed for [${key()}]: [${e.javaClass.simpleName}] ${e.message}", e)
-                AppLogger.e("Client", "Failed to connect to proxy $proxyIp:$proxyPort for $dstStr:$dstPort: ${e.message}")
+                AppLogger.e("Client", "Proxy connection failed; session=${key()}; proxy=$proxyIp:$proxyPort; protocol=${if (isSocks5) "SOCKS5" else "HTTP_CONNECT"}; phase=$phase; elapsed_ms=${io.github.arttolst12.netion.DiagnosticText.elapsedMillis(startedNanos)}", e)
                 sendRst()
             }
             close()
@@ -536,227 +516,219 @@ class TcpSession(
 
     /** Triggers upload draining; uses selector interest if attached, or coalesced worker */
     fun triggerUploadDrain() {
-        if (selectionKey != null) {
-            synchronized(stateLock) {
-                updateInterestOpsLocked()
-            }
+        if (isDead) return
+        if (selectionKey != null || onEstablished != null) {
+            updateInterestOps()
             return
         }
-
-        // Standalone coalesced drain
+        if (proxyChannel == null && proxyOut == null) return
         if (isDraining.compareAndSet(false, true)) {
             try {
                 sharedDrainPool.execute {
-                    try {
-                        drainUploadQueue()
-                    } finally {
+                    try { drainUploadQueue() } finally {
                         isDraining.set(false)
-                        var hasMore = false
-                        synchronized(stateLock) {
-                            hasMore = uploadQueue.isNotEmpty() || (clientFinReceived && !proxyOutputShutdown)
+                        val retry = synchronized(stateLock) {
+                            !isDead && proxyChannel == null && proxyOut != null &&
+                                (uploadQueue.isNotEmpty() || (clientFinReceived && !proxyOutputShutdown))
                         }
-                        if (hasMore) {
-                            triggerUploadDrain()
-                        }
+                        if (retry) triggerUploadDrain()
                     }
                 }
-            } catch (_: Exception) {
+            } catch (_: RejectedExecutionException) {
                 isDraining.set(false)
+                sendRst()
+                close()
             }
         }
     }
 
-    /**
-     * Drains pending chunks from uploadQueue into proxy channel.
-     * When client has sent FIN and all upload chunks are flushed, performs shutdownOutput().
-     */
+    /** The token covers buffer selection, partial I/O and accounting commit. */
     fun drainUploadQueue() {
-        synchronized(writeLock) {
-            while (true) {
-                var chunk: ByteBuffer? = null
-                var shouldShutdown = false
-                synchronized(stateLock) {
+        if (!drainOwner.compareAndSet(false, true)) return
+        try {
+            while (!isDead) {
+                var shutdown = false
+                val chunk = synchronized(stateLock) {
                     if (isDead) return
-                    chunk = uploadQueue.peekFirst()
-                    if (chunk == null) {
-                        if (clientFinReceived && !proxyOutputShutdown) {
-                            proxyOutputShutdown = true
-                            shouldShutdown = true
-                        }
-                    }
+                    val head = uploadQueue.peekFirst()
+                    if (head == null && clientFinReceived && !proxyOutputShutdown) shutdown = true
+                    head
                 }
-
-                if (chunk != null) {
-                    val buf = chunk!!
-                    val written: Int
-                    try {
+                if (chunk == null) {
+                    if (shutdown) {
                         val channel = proxyChannel
-                        if (channel != null && channel.isOpen) {
-                            written = channel.write(buf)
-                        } else {
-                            val out = proxyOut ?: return
-                            val rem = buf.remaining()
-                            val bytes = ByteArray(rem)
-                            buf.get(bytes)
-                            out.write(bytes)
-                            out.flush()
-                            written = rem
+                        val socket = proxySocket
+                        if (channel == null && socket == null) return
+                        try {
+                            if (channel != null) channel.shutdownOutput() else socket?.shutdownOutput()
+                        } catch (_: Exception) {
+                            if (!isDead) { sendRst(); close() }
+                            return
                         }
-                    } catch (e: Exception) {
-                        Log.d(TAG, "Proxy write failed: ${e.message}")
+                        synchronized(stateLock) {
+                            if (!isDead) {
+                                proxyOutputShutdown = true
+                                updateInterestOpsLocked()
+                                maybeFinishLocked()
+                            }
+                        }
+                    } else updateInterestOps()
+                    return
+                }
+                val written: Int
+                try {
+                    val channel = proxyChannel
+                    if (channel != null) written = channel.write(chunk) else {
+                        val output = proxyOut ?: return
+                        val size = chunk.remaining()
+                        val bytes = ByteArray(size)
+                        chunk.duplicate().get(bytes)
+                        output.write(bytes)
+                        output.flush()
+                        chunk.position(chunk.position() + size)
+                        written = size
+                    }
+                } catch (_: Exception) {
+                    if (!isDead) sendRst()
+                    close()
+                    return
+                }
+                synchronized(stateLock) {
+                    if (isDead) return // close() owns all remaining reservations.
+                    if (written > 0) {
+                        uploadQueueBytes -= written
+                        releaseMemoryLocked(written)
+                        if (!chunk.hasRemaining()) uploadQueue.removeFirst()
+                        markActive()
+                        if (uploadQueueBytes <= LOW_WATERMARK) sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0))
+                    }
+                    updateInterestOpsLocked()
+                }
+                if (written == 0) return
+            }
+        } finally {
+            drainOwner.set(false)
+        }
+    }
+
+    private fun sendTrackedLocked(flags: Int, payload: ByteArray): Boolean {
+        val segment = SentSegment(ourSeq, payload, flags, nanoTime())
+        unacknowledged.addLast(segment)
+        if (!sendTcpPacketLocked(flags, payload, flags and PacketUtils.TCP_SYN != 0, segment.sequence)) return false
+        ourSeq = (ourSeq + segment.sequenceLength) and 0xFFFFFFFFL
+        return true
+    }
+
+    private fun flushDownstreamLocked() {
+        if (isDead) return
+        while (pendingDownload.isNotEmpty()) {
+            val credit = sendCreditLocked()
+            if (credit <= 0) break
+            val pending = pendingDownload.peekFirst() ?: break
+            val size = minOf(MSS, pending.remaining(), credit)
+            val bytes = ByteArray(size)
+            pending.get(bytes)
+            if (!pending.hasRemaining()) pendingDownload.removeFirst()
+            if (!sendTrackedLocked(PacketUtils.TCP_ACK or PacketUtils.TCP_PSH, bytes)) return
+        }
+        if (proxyReadEof && !ourFinSent && pendingDownload.isEmpty() && sendCreditLocked() > 0) {
+            ourFinSequence = ourSeq
+            ourFinSent = true
+            sendTrackedLocked(PacketUtils.TCP_FIN or PacketUtils.TCP_ACK, ByteArray(0))
+        }
+    }
+
+    /** Never read more downstream data than the peer window and bounded budgets allow. */
+    fun onProxyReadable(buf: ByteBuffer = ByteBuffer.allocate(MSS)) {
+        if (!readOwner.compareAndSet(false, true)) return
+        try {
+            val channel = proxyChannel ?: return
+            val capacity = synchronized(stateLock) {
+                if (isDead || proxyReadEof) return
+                val count = minOf(MSS, buf.capacity(), sendCreditLocked(), downloadSpaceLocked())
+                if (count <= 0 || !reserveMemory(globalDownloadMemoryTracker, count, MAX_GLOBAL_DOWNLOAD_BYTES)) {
+                    updateInterestOpsLocked()
+                    return
+                }
+                downloadQueueBytes += count
+                count
+            }
+            buf.clear()
+            buf.limit(capacity)
+            val n = try { channel.read(buf) } catch (_: Exception) {
+                sendRst()
+                close()
+                return
+            }
+            synchronized(stateLock) {
+                if (isDead) return
+                val unused = capacity - maxOf(0, n)
+                downloadQueueBytes -= unused
+                if (unused > 0) globalDownloadMemoryTracker?.addAndGet(-unused.toLong())
+                if (n > 0) {
+                    buf.flip()
+                    val bytes = ByteArray(n)
+                    buf.get(bytes)
+                    pendingDownload.addLast(ByteBuffer.wrap(bytes))
+                    markActive()
+                } else if (n == -1) proxyReadEof = true
+                flushDownstreamLocked()
+                updateInterestOpsLocked()
+                maybeFinishLocked()
+            }
+        } finally { readOwner.set(false) }
+    }
+
+    fun onProxyWritable() { drainUploadQueue() }
+
+    private fun maybeFinishLocked() {
+        if (clientFinReceived && proxyOutputShutdown && ourFinAcknowledged && uploadQueueBytes == 0) close()
+    }
+
+    /** Driven by the runtime even on idle selector ticks, so a lost packet cannot stall forever. */
+    fun onTimer(nowNanos: Long = nanoTime()) {
+        synchronized(stateLock) {
+            if (isDead || state == State.CONNECTING) return
+            val oldest = unacknowledged.peekFirst()
+            if (oldest != null) {
+                val rto = minOf(8_000_000_000L, 500_000_000L shl oldest.retries.coerceAtMost(4))
+                if (nowNanos - oldest.sentAtNs >= rto) {
+                    if (oldest.retries >= 6) {
+                        AppLogger.w("TCP", "Retransmission limit reached; session=${key()}; retries=${oldest.retries}; unacked_bytes=${(ourSeq - sndUna) and 0xFFFFFFFFL}; peer_window=$peerWindow")
                         sendRst()
                         close()
                         return
                     }
-
-                    if (written > 0) {
-                        var triggerWindowUpdate = false
-                        var currentWin = 0
-                        synchronized(stateLock) {
-                            if (!isDead && state != State.CLOSED) {
-                                uploadQueueBytes = (uploadQueueBytes - written).coerceAtLeast(0)
-                                releaseMemoryLocked(written)
-                                if (!buf.hasRemaining()) {
-                                    uploadQueue.pollFirst()
-                                }
-                                updateInterestOpsLocked()
-                                // Check if queue dropped below LOW_WATERMARK
-                                if (uploadQueueBytes <= LOW_WATERMARK) {
-                                    currentWin = computeAdvertisedWindowLocked()
-                                    if (currentWin > 0) {
-                                        triggerWindowUpdate = true
-                                    }
-                                }
-                            }
-                        }
-                        if (triggerWindowUpdate) {
-                            sendWindowUpdate(currentWin)
-                        }
-                    }
-
-                    if (buf.hasRemaining()) {
-                        // Socket channel write buffer full; OP_WRITE will re-trigger
-                        break
-                    }
-                } else if (shouldShutdown) {
-                    try {
-                        proxyChannel?.shutdownOutput()
-                        proxySocket?.shutdownOutput()
-                    } catch (_: Exception) {}
-                    synchronized(stateLock) {
-                        updateInterestOpsLocked()
-                    }
-                    break
-                } else {
-                    synchronized(stateLock) {
-                        updateInterestOpsLocked()
-                    }
-                    break
+                    if (!sendTcpPacketLocked(oldest.flags, oldest.payload,
+                            oldest.flags and PacketUtils.TCP_SYN != 0, oldest.sequence)) return
+                    oldest.sentAtNs = nowNanos
+                    oldest.retries++
                 }
+            } else if (peerWindow == 0 && nowNanos - lastProbeNs >= 1_000_000_000L) {
+                sendTcpPacketLocked(PacketUtils.TCP_ACK, byteArrayOf(0), overrideSeq = (ourSeq - 1) and 0xFFFFFFFFL)
+                lastProbeNs = nowNanos
             }
+            flushDownstreamLocked()
+            updateInterestOpsLocked()
+            maybeFinishLocked()
         }
     }
 
-    private fun sendWindowUpdate(windowSize: Int) {
-        synchronized(stateLock) {
-            if (isDead) return
-            sendTcpPacketLocked(PacketUtils.TCP_ACK, ByteArray(0), windowSize = windowSize)
-        }
-    }
-
-    /** Non-blocking selector callback when proxy channel is readable */
-    fun onProxyReadable(buf: ByteBuffer = ByteBuffer.allocate(MSS)) {
-        val channel = proxyChannel ?: return
-        buf.clear()
-        val n: Int
-        try {
-            n = channel.read(buf)
-        } catch (e: Exception) {
-            close()
-            return
-        }
-        if (n == -1) {
-            handleProxyEof()
-            return
-        }
-        if (n > 0) {
-            buf.flip()
-            val chunk = ByteArray(n)
-            buf.get(chunk)
-            markActive()
-            synchronized(stateLock) {
-                if (isDead) return
-                sendTcpPacketLocked(
-                    PacketUtils.TCP_ACK or PacketUtils.TCP_PSH,
-                    chunk,
-                    windowSize = computeAdvertisedWindowLocked()
-                )
-                ourSeq = (ourSeq + n) and 0xFFFFFFFFL
-            }
-        }
-    }
-
-    /** Non-blocking selector callback when proxy channel is writable */
-    fun onProxyWritable() {
-        drainUploadQueue()
-    }
-
-    private fun handleProxyEof() {
-        synchronized(stateLock) {
-            if (!isDead) {
-                // Remote proxy closed → send FIN to client
-                sendTcpPacketLocked(
-                    PacketUtils.TCP_FIN or PacketUtils.TCP_ACK,
-                    ByteArray(0),
-                    windowSize = computeAdvertisedWindowLocked()
-                )
-                ourSeq = (ourSeq + 1) and 0xFFFFFFFFL
-            }
-        }
-        close()
-    }
-
-    /** Standalone loop for reading from upstream proxy when Selector is not attached */
+    /** Standalone mode uses the same non-blocking read/drain state machine as the selector. */
     fun proxyReaderLoop() {
-        val channel = proxyChannel
-        val readBuf = ByteBuffer.allocate(MSS)
+        val buffer = ByteBuffer.allocate(MSS)
         try {
             while (!isDead) {
-                readBuf.clear()
-                val n: Int
-                if (channel != null && channel.isOpen) {
-                    n = channel.read(readBuf)
-                } else {
-                    val bytes = ByteArray(MSS)
-                    n = proxyIn?.read(bytes) ?: break
-                    if (n > 0) {
-                        readBuf.put(bytes, 0, n)
-                    }
-                }
-                if (n == -1) break
-                if (n == 0) {
-                    Thread.sleep(10)
-                    continue
-                }
-                markActive()
-                readBuf.flip()
-                val chunk = ByteArray(n)
-                readBuf.get(chunk)
-                synchronized(stateLock) {
-                    if (isDead) break
-                    // Send data to client via TUN
-                    sendTcpPacketLocked(
-                        PacketUtils.TCP_ACK or PacketUtils.TCP_PSH,
-                        chunk,
-                        windowSize = computeAdvertisedWindowLocked()
-                    )
-                    ourSeq = (ourSeq + n) and 0xFFFFFFFFL
-                }
+                onProxyReadable(buffer)
+                triggerUploadDrain()
+                onTimer()
+                Thread.sleep(10)
             }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
         } catch (_: Exception) {
-            // Socket closed or error
-        }
-        handleProxyEof()
+            if (!isDead) sendRst()
+        } finally { close() }
     }
 
     // ─────────────────────────────────────────────────────────
@@ -769,11 +741,11 @@ class TcpSession(
         includeMss: Boolean = false,
         overrideSeq: Long? = null,
         windowSize: Int? = null
-    ) {
-        if (isDead && (flags and PacketUtils.TCP_RST) == 0) return
+    ): Boolean {
+        if (isDead && (flags and PacketUtils.TCP_RST) == 0) return false
         val seq = overrideSeq ?: ourSeq
         val win = windowSize ?: computeAdvertisedWindowLocked()
-        try {
+        return try {
             val pkt = PacketUtils.buildTcpPacket(
                 srcIp      = dstIp,    // swap: we pretend to be the destination
                 dstIp      = srcIp,
@@ -787,8 +759,11 @@ class TcpSession(
                 includeMss = includeMss
             )
             tunWriter?.write(pkt)
+            true
         } catch (e: Exception) {
             Log.d(TAG, "TUN write failed: ${e.message}")
+            close()
+            false
         }
     }
 
@@ -816,63 +791,24 @@ class TcpSession(
 
     fun close() {
         if (!closed.compareAndSet(false, true)) return
-        var toRelease = 0
+        // Close I/O before taking stateLock; teardown never needs the drain token.
+        try { proxyChannel?.close() } catch (_: Exception) {}
+        try { proxySocket?.close() } catch (_: Exception) {}
         synchronized(stateLock) {
             state = State.CLOSED
-            toRelease = uploadQueueBytes
+            releaseMemoryLocked(uploadQueueBytes)
+            if (downloadQueueBytes > 0) globalDownloadMemoryTracker?.addAndGet(-downloadQueueBytes.toLong())
             uploadQueueBytes = 0
+            downloadQueueBytes = 0
             uploadQueue.clear()
+            pendingDownload.clear()
+            unacknowledged.clear()
             try { selectionKey?.cancel() } catch (_: Exception) {}
             selectionKey = null
         }
-        if (toRelease > 0) {
-            releaseMemoryLocked(toRelease)
-        }
-        try { proxyChannel?.close() } catch (_: Exception) {}
-        try { proxySocket?.close() } catch (_: Exception) {}
+        selector?.wakeup()
     }
 
     fun key() = "$srcPort→${PacketUtils.ipToString(dstIp)}:$dstPort"
 
-    // ─────────────────────────────────────────────────────────
-    // Helpers
-    // ─────────────────────────────────────────────────────────
-
-    private fun readFully(input: InputStream, b: ByteArray) {
-        var total = 0
-        while (total < b.size) {
-            val count = input.read(b, total, b.size - total)
-            if (count < 0) throw java.io.EOFException("Premature EOF")
-            total += count
-        }
-    }
-
-    private fun readHttpResponse(input: InputStream): String {
-        val sb = StringBuilder()
-        while (true) {
-            val b = input.read()
-            if (b == -1) break
-            sb.append(b.toChar())
-            if (sb.length >= 4 && sb.substring(sb.length - 4) == "\r\n\r\n") break
-            if (sb.length > 4096) break
-        }
-        return sb.toString().lines().firstOrNull() ?: ""
-    }
-}
-
-/**
- * Thread-safe wrapper for writing packets to TUN FileOutputStream.
- */
-class TunWriter(
-    private val fd: java.io.OutputStream,
-    private val onBytesWritten: ((Int) -> Unit)? = null
-) {
-    private val lock = Any()
-    fun write(packet: ByteArray) {
-        synchronized(lock) {
-            fd.write(packet)
-            fd.flush()
-        }
-        onBytesWritten?.invoke(packet.size)
-    }
 }
